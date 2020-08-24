@@ -128,7 +128,7 @@ Matplotlib.axes
 '''
 
 # constant (set it to np.log(10.0) if you wish to go from dex to fractional error in scatter)
-Ln10 = 1.0
+Ln10 = np.log(10.0) #1.0
 
 def setup_color(color, split_bins, cmap=None):
     """
@@ -539,6 +539,9 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, nbins=25, xrange=None, nBootstrap=
 
     lm = kllr_model(kernel_type, kernel_width)
 
+    #Dictionary to store values
+    output_Data = {}
+
     # size of matrix
     if Output_mode.lower() in ['covariance', 'cov']:
 
@@ -609,7 +612,7 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, nbins=25, xrange=None, nBootstrap=
             x_data, y_data, z_data = x_data[mask], y_data[mask], z_data[mask]
 
             xline = np.linspace(xrange[0], xrange[1], nbins)
-            xline = (xline[1:] + xline[:-1]) / 2.
+            # xline = (xline[1:] + xline[:-1]) / 2.
 
             cov_corr = np.zeros([nBootstrap, len(xline)])
 
@@ -631,6 +634,18 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, nbins=25, xrange=None, nBootstrap=
                         cov_corr[iBoot, k] = lm.calc_covariance_fixed_x(xx, yy, zz, xline[k])
                     elif Output_mode.lower() in ['correlation', 'corr']:
                         cov_corr[iBoot, k] = lm.calc_correlation_fixed_x(xx, yy, zz, xline[k])
+
+
+            output_Data['x'] = xline
+
+            if Output_mode.lower() in ['covariance', 'cov']:
+                name = 'cov'
+            elif Output_mode.lower() in ['correlation', 'corr']:
+                name = 'corr'
+
+            output_Data['%s_%s_%s'%(name, ylabel, zlabel)]  = np.median(cov_corr, axis=0)
+            output_Data['%s_%s_%s-'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[0], axis=0)
+            output_Data['%s_%s_%s+'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[1], axis=0)
 
             if matrix_size > 1:
                 ax_tmp = ax[row, col]
@@ -675,7 +690,7 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, nbins=25, xrange=None, nBootstrap=
     if Output_mode.lower() in ['correlation', 'corr']: plt.subplots_adjust(hspace=0.04, wspace=0.04)
     else: plt.subplots_adjust(hspace=0.04)
 
-    return ax
+    return output_Data, ax
 
 
 def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], Output_mode='Covariance',
@@ -795,7 +810,7 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
                     split_mask = (split_res < split_bins[k + 1]) & (split_res > split_bins[k])
 
                 xline = np.linspace(xrange[0], xrange[1], nbins)
-                xline = (xline[1:] + xline[:-1]) / 2.
+                # xline = (xline[1:] + xline[:-1]) / 2.
 
                 cov_corr = np.zeros([nBootstrap, len(xline)])
 
