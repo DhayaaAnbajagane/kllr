@@ -403,11 +403,25 @@ class kllr_model():
              Individual residuals.
         """
 
+        if kernel_width is not None:
+
+            #If kernel_width is just one number, then turn it
+            #into an array of length = nbins
+            if isinstance(kernel_width, (int, float)):
+                kernel_width_array = np.zeros(nbins)*kernel_width
+
+            #Else just add kerneL_width info
+            else:
+                kernel_width_array = kernel_width
+
+        #If no kerneL_width provided, then use default
+        else:
+
+            kernel_width = self.kernel_width
+
         if kernel_type is not None:
             self.kernel_type = kernel_type
 
-        if kernel_width is not None:
-            self.kernel_width = kernel_width
 
         res = np.array([])  # Array to store residuals
         Index = np.array([])  # array to map what residual belongs to what Halo
@@ -416,15 +430,15 @@ class kllr_model():
         # changing it only changes accuracy a bit (narrower bins means interpolations are more accurate),
         # and also changes computation time
         if xrange is None:
-            xline = np.linspace(np.min(x) - 0.01, np.max(x) + 0.01, nbins)
+            xline = np.linspace(np.min(x) - 0.01, np.max(x) + 0.01, nbins, endpoint=True)
         else:
-            xline = np.linspace(xrange[0], xrange[1], nbins)
+            xline = np.linspace(xrange[0], xrange[1], nbins, endpoint=True)
 
         # Loop over each bin defined by the bin edges above
         for i in range(len(xline) - 1):
             # Compute weight at each edge
-            w1 = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i], width=self.kernel_width)
-            w2 = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i + 1], width=self.kernel_width)
+            w1 = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i], width=kernel_width_array[i])
+            w2 = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i + 1], width=kernel_width_array[i + 1])
 
             # Compute expected y-value at each bin-edge
             intercept1, slope1, scatter1 = self.linear_regression(x, y, weight=w1)
@@ -602,12 +616,31 @@ class kllr_model():
 
         # Define x_values to compute regression parameters at
         if xrange is None:
-            xline = np.linspace(np.min(x), np.max(x), nbins)
+            xline = np.linspace(np.min(x), np.max(x), nbins, endpoint=True)
         else:
-            xline = np.linspace(xrange[0], xrange[1], nbins)
+            xline = np.linspace(xrange[0], xrange[1], nbins, endpoint=True)
 
         if kernel_width is not None:
-            self.kernel_width = kernel_width
+
+            #If kernel_width is just one number, then turn it
+            #into an array of length = nbins
+            if isinstance(kernel_width, (int, float)):
+                kernel_width_array = np.zeros(nbins)*kernel_width
+
+            elif len(kernel_width) != len(xline):
+
+                #Check if kernel_width has right dimensions
+                raise ValueError("Size mismatch: kernel_width has length %d. Paramater nbins = %d"%(len(kernel_width), nbins))
+
+            #Otherwise rename value for rest of code
+            else:
+                kernel_width_array = kernel_width
+
+        #If no kerneL_width provided, then use default
+        else:
+
+            kernel_width = self.kernel_width
+
 
         if kernel_type is not None:
             self.kernel_type = kernel_type
@@ -619,7 +652,7 @@ class kllr_model():
         # loop over every sample point
         for i in range(len(xline)):
             # Generate weights at that sample point
-            w = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i], width=self.kernel_width)
+            w = calculate_weigth(x, kernel_type=self.kernel_type, mu=xline[i], width=kernel_width_array[i])
             # Compute fit params using linear regressions
             intercept_exp[i], slope_exp[i], scatter_exp[i] = self.linear_regression(x, y, weight=w)
             # Generate expected y_value using fit params
