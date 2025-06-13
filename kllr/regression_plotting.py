@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
-from scipy import stats
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from .regression_model import kllr_model, setup_bins
+from .regression_model import kllr_model, calculate_weigth
 
-
-# Plotting parameters
+'''
+Plotting Params
+'''
 import matplotlib as mpl
 
 mpl.rcParams['xtick.direction'], mpl.rcParams['ytick.direction'] = 'in', 'in'
@@ -16,22 +16,40 @@ mpl.rcParams['xtick.major.pad'], mpl.rcParams['xtick.minor.pad'] = 10, 10
 mpl.rcParams['ytick.major.size'], mpl.rcParams['ytick.minor.size'] = 14, 8
 mpl.rcParams['ytick.major.width'], mpl.rcParams['ytick.minor.width'] = 1.2, 0.8
 mpl.rcParams['xtick.labelsize'], mpl.rcParams['ytick.labelsize'] = 20, 20
+default_cmap = plt.cm.viridis
 
-# Parameters used in this module
-# One dictionary to store default values
-# Another that user can view/change as necessary
-Default_Params = {'default_cmap'   : plt.cm.coolwarm,
-                  'title_fontsize' : 25,
-                  'legend_fontsize': 22,
-                  'xlabel_fontsize': 30,
-                  'ylabel_fontsize': 30,
-                  'scatter_factor' : 1.0}
+'''
+Initiate Dataset:
+    All variables can be accesses and modified as seen fit by user.
+    eg. Class.fontsize.xlabel = 0
+    eg. Class.Colors = ['red', 'blue', 'aqua']
+'''
 
-Params = Default_Params.copy()
+# Dictionary that allows user to change fontsize of plots whenever necessary
+fontsize = pd.Series({
+    'title': 25,
+    'legend': 18,
+    'xlabel': 25,
+    'ylabel': 25
+})
 
 '''
 Plotting functions
 
+-------------------
+Disclaimer:
+-------------------
+
+(i)   In general, any function that does a split in a 3rd variable only includes data with x_data > cutoff.
+
+(ii)  Functions that do NOT do a split include data from x_data > cutoff - 0.5.
+
+(iii) The choice in (ii) is needed because LLR uses all the data, and so not including data beneath cutoff value
+      introduces artifacts at the x-value boundary
+
+(iv)  However, including the x_data > cutoff - 0.5 clause in the split version will mess up how we split the data according to the 3rd variable.
+      We split the data into bins in split_variable, where each bin contains an equal number of halos.
+      So including the halos below our cutoff will change how our bin-edges are determined and thus affect our results.
 
 Parameters
 -------------
@@ -47,7 +65,7 @@ show_data : boolean
     Used in Plot_Fit function to show the datapoints used to make the LLR fit.
     Is set to show_data = False, by default
 
-bins : int
+nbins : int
     Sets the number of points within x_range that the parameters are sampled at.
     When plotting a PDF it sets the number of bins the PDF is split into.
 
@@ -90,12 +108,6 @@ funcs : dictionary
 verbose : boolean
     Controls the verbosity of the model's output.
 
-fast_calc : boolean
-    When False, do nothing
-    When True , the method only uses data within 3 x kernel_width from the scale mu.
-    It speeds up the calculation by removing objects that have exteremly small weight.
-
-
 Returns
 ----------
 
@@ -110,7 +122,13 @@ Dictionary
 Matplotlib.axes
     Axes on which results were plotted
 
+## TODO:
+    * give an error : data, ax = Plot_Fit_Split(df, 'M200', 'MStar_BCG100', 'z_form', split_bins=3, split_mode='Residuals')
+    * What to do if df labels are int instead of str (eg. 1, 2, 3 etc.)
 '''
+
+# constant (set it to np.log(10.0) if you wish to go from dex to fractional error in scatter)
+Ln10 = np.log(10.0) #1.0
 
 def setup_color(color, split_bins, cmap=None):
     """
@@ -144,7 +162,7 @@ def setup_color(color, split_bins, cmap=None):
                                  'len(color) must be larger than split bins.')
 
     if cmap is None:
-        cmap = Params['default_cmap']
+        cmap = default_cmap
 
     if color is None:
         if isinstance(split_bins, int):
@@ -154,368 +172,123 @@ def setup_color(color, split_bins, cmap=None):
 
     return color
 
-
-def set_params(**kwargs):
-
-    '''
-    Change default params used by all functions here.
-    If input contains "reset = True", then all Params
-    will be set to their default values.
-    '''
-
-    for key in kwargs.keys():
-
-        if key in Params.keys():
-            Params[key] = kwargs[key]
-
-        elif key.lower() == 'reset':
-
-            if kwargs[key] == True:
-
-                for key in Default_Params.keys():
-                    Params[key] = Default_Params[key]
-
-        else:
-            print("Param '%s' is invalid. This was no used to update our settings."%key)
-
-
-def get_params():
-
-    '''
-    Returns the Parameter dictionary of this module
-    for user to view.
-    '''
-
-    return Params
-
-
-def Plot_Fit_Summary(df, xlabel, ylabel, y_err=None, bins=25, xrange=None, nBootstrap=100,
-                     verbose = True, percentile=[16., 84.], kernel_type='gaussian', kernel_width=0.2, fast_calc = False,
-                     linestyle = '-', alpha=1.0, black_line = True,
-                     show_data=False, xlog=False, ylog=False, color=None, labels=None, ax=None):
-    '''
-
-    This function visualizes the estimated local fitted parameters (normalization, slope, and scatter).
-
-    Parameters
-    -------------
-
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    verbose : boolean
-        Controls the verbosity of the model's output.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-    show_data : boolean
-        Used in Plot_Fit function to show the datapoints used to make the LLR fit.
-        Is set to show_data = False, by default
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+def Plot_Fit(df, xlabel, ylabel, nbins=25, xrange=None, show_data=False,
+             kernel_type='gaussian', kernel_width=0.2, xlog=False, ylog=False, ls = '-',
+             color=None, labels=None, ax=None):
 
     lm = kllr_model(kernel_type, kernel_width)
 
-    # Generate figure if none provided
-    if ax is None:
-        fig, ax = plt.subplots(3, 1, figsize=(12, 19), sharex = True,
-                               gridspec_kw = {'height_ratios':[1.75, 1, 1]})
+    if ax == None:
+        ax = plt.figure(figsize=(12, 8))
 
-        plt.subplots_adjust(hspace = 0.05)
+    plt.grid()
 
-    [a.grid(True) for a in ax]
-
-    if xlog: ax[2].set_xscale('log')
-    if ylog: ax[0].set_yscale('log')
+    if xlog: plt.xscale('log')
+    if ylog: plt.yscale('log')
 
     if labels is None:
         labels = [xlabel, ylabel]
 
-    # Dictionary that will store our
-    # final output to be given to
-    # the user
     output_Data = {}
 
-    # Load and clean data
-    x_data, y_data = df[xlabel].to_numpy(), df[ylabel].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data)
-    x_data, y_data = x_data[Mask], y_data[Mask]
+    x_data, y_data = np.array(df[xlabel]), np.array(df[ylabel])
 
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data))
 
-    else:
-        y_err_data = None
+    x_data, y_data = x_data[mask], y_data[mask]
 
-    # Perform fit
-    Fit_Output = lm.fit(x_data, y_data, y_err_data, xrange, bins, nBootstrap, fast_calc, verbose)
-
-    x, y = Fit_Output[0], Fit_Output[1]
-    slope, scatter = Fit_Output[3], Fit_Output[4]
-    scatter = scatter * Params['scatter_factor']
-
-    # Reshape outputs so code is general even for nBootstrap = 1
-    if nBootstrap == 1: y, slope, scatter = y[None, :], slope[None, :], scatter[None, :]
+    x, y = lm.fit(x_data, y_data, xrange=xrange, nbins=nbins)[0:2]
 
     if xlog: x = 10 ** x
     if ylog: y = 10 ** y
 
     # Add black line around regular line to improve visibility
-    if black_line: ax[0].plot(x, np.percentile(y, 50, 0), linestyle=linestyle, alpha=alpha, lw=6, color='k', label="")
+    plt.plot(x, y, lw=6, color = 'k', label="", ls = ls)
+    plt.plot(x, y, lw=3, color = color, ls = ls)
 
-    p = ax[0].plot(x, np.percentile(y, 50, 0), linestyle=linestyle, lw=3, alpha=alpha, color=color)
-    color = p[0].get_color()
+    output_Data['x'] = x
+    output_Data['y'] = y
 
-    ax[0].fill_between(x, np.percentile(y, percentile[0], 0), np.percentile(y, percentile[1], 0),
-                       lw=3, color=color, alpha = alpha/3.0)
+    # Code for bootstrapping the <y | x> values.
+    # We don't use it since the uncertainty is very small in our case (not visible actually)
 
     if show_data:
 
-        # Show raw data only with xrange that the fit was computed for
-
-        if xlog:
-            Mask = (x_data >= np.min(np.log10(x))) & (x_data <= np.max(np.log10(x)))
+        #Generate Mask so raw data is shown only for values of x_data within xrange
+        if xrange == None:
+            #If no xrange inputted, mask selected all available data
+            Mask = np.ones(x_data.size, bool)
         else:
-            Mask = (x_data >= np.min(x)) & (x_data <= np.max(x))
+            Mask = (x_data > xrange[0]) & (x_data < xrange[1])
 
-        x_data_show, y_data_show = x_data[Mask], y_data[Mask]
+        x_data, y_data = x_data[Mask], y_data[Mask]
 
-        if xlog: x_data_show = 10 ** x_data_show
-        if ylog: y_data_show = 10 ** y_data_show
-        ax[0].scatter(x_data_show, y_data_show, s=30, alpha=alpha / 3.5, color=color, label="")
+        if xlog: x_data = 10 ** x_data
+        if ylog: y_data = 10 ** y_data
+        plt.scatter(x_data, y_data, s=30, alpha=0.3, color = color, label="")
 
-    ax[1].plot(x, np.percentile(slope, 50, 0), linestyle=linestyle, lw=3, color=color, alpha = alpha)
-    ax[1].fill_between(x, np.percentile(slope, percentile[0], 0), np.percentile(slope, percentile[1], 0),
-                       alpha = alpha/3.0, label=None, color=color)
-
-    ax[2].plot(x, np.percentile(scatter, 50, 0) , linestyle=linestyle, lw=3, color=color, alpha = alpha)
-    ax[2].fill_between(x, np.percentile(scatter, percentile[0], 0), np.percentile(scatter, percentile[1], 0),
-                       alpha = alpha/3.0, label=None, color=color)
-
-    ax[0].set_ylabel(labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_ylabel(r"$\beta\,$(%s)" % labels[1],  size=Params['ylabel_fontsize'])
-    ax[2].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[2].set_xlabel(labels[0], size=Params['xlabel_fontsize'])
-
-    output_Data['x']  = x
-
-    output_Data['y']  = np.percentile(y, 50, 0)
-    output_Data['y-'] = np.percentile(y, percentile[0], 0)
-    output_Data['y+'] = np.percentile(y, percentile[1], 0)
-
-    output_Data['slope']  = np.percentile(slope, 50, 0)
-    output_Data['slope-'] = np.percentile(slope, percentile[0], 0)
-    output_Data['slope+'] = np.percentile(slope, percentile[1], 0)
-
-    output_Data['scatter']  = np.percentile(scatter, 50, 0)
-    output_Data['scatter-'] = np.percentile(scatter, percentile[0], 0)
-    output_Data['scatter+'] = np.percentile(scatter, percentile[1], 0)
+    plt.xlabel(labels[0], size=fontsize.xlabel)
+    plt.ylabel(labels[1], size=fontsize.ylabel)
 
     return output_Data, ax
 
+def Plot_Fit_Split(df, xlabel, ylabel, split_label, split_bins=[], nbins=25, xrange=None,
+                   show_data=False, split_mode='Data', kernel_type='gaussian', kernel_width=0.2,
+                   xlog=False, ylog=False, color=None, labels=None, ax=None):
 
-def Plot_Fit_Summary_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mode = 'Data', y_err=None, bins=25, xrange=None,
-                           nBootstrap=100, verbose = True, percentile=[16., 84.], kernel_type='gaussian', kernel_width=0.2, fast_calc = False,
-                           linestyle = '-', alpha = 1.0, black_line = True,
-                           show_data=False, xlog=False, ylog=False, color=None, labels=None, cmap = None, ax=None):
-    '''
+    check_attributes(split_bins=split_bins, split_mode=split_mode)
 
-    This function stratifies data on split variable and then visualizes
-     estimated local fitted parameters (normalization, slope, and scatter).
+    lm = kllr_model(kernel_type, kernel_width)
 
-    Parameters
-    -------------
-
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    show_data : boolean
-        Used in Plot_Fit function to show the datapoints used to make the LLR fit.
-        Is set to show_data = False, by default
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    split_label : str
-        Label of the data vector used to split the data, or condition the data, on a secondary variable.
-
-    split_bins : int, list, tuple, numpy array
-        Can be either number of bins (int), or array of bin_edges.
-
-        If an int is provided the modules will determine the bin edges themselves using the data vector.
-        By default, edges are set so there are equal number of data points in each bin.
-        Note that the bin edges in this case will be determined using all data passed into the function. However,
-        the plotting and computations will be done only using data with x-values within the bounds set by the xrange parameter.
-
-        If a list is provided then the list elements serve as the bin edges
-
-    split_mode : str
-        Sets how the data is split/conditioned based on the split variable
-        If 'Data', then all halos are binned based on the variable df[split_label]
-        If 'Residuals', then we fit split_label vs. xlabel, then split the data into bins based on the residual values
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    verbose : boolean
-        Controls the verbosity of the model's output.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
-
-    lm    = kllr_model(kernel_type, kernel_width)
-    color = setup_color(color, split_bins, cmap)
-
-    # Generate figure if none provided
     if ax is None:
-        fig, ax = plt.subplots(3, 1, figsize=(12, 19), sharex = True,
-                               gridspec_kw = {'height_ratios':[1.75, 1, 1]})
+        ax = plt.figure(figsize=(12, 8))
 
-        plt.subplots_adjust(hspace = 0.05)
+    color = setup_color(color, split_bins, cmap=None)
 
-    [a.grid(True) for a in ax]
+    plt.grid()
 
-    if xlog: ax[2].set_xscale('log')
-    if ylog: ax[0].set_yscale('log')
+    if xlog: plt.xscale('log')
+    if ylog: plt.yscale('log')
 
     # If 3 labels not inserted, default to column names
     if labels is None:
         labels = [xlabel, ylabel, split_label]
 
-    x_data, y_data, split_data = df[xlabel].to_numpy(), df[ylabel].to_numpy(), df[split_label].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data) & clean_vector(split_data)
-    x_data, y_data, split_data = x_data[Mask], y_data[Mask], split_data[Mask]
+    x_data, y_data, split_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[split_label])
 
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data)) & np.invert(np.isinf(split_data))
 
-
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
-
-    else:
-        y_err_data = None
+    x_data, y_data, split_data = x_data[mask], y_data[mask], split_data[mask]
 
     # Choose bin edges for binning data
-    if isinstance(split_bins, int):
-
+    # Choose bin edges for binning data
+    if (isinstance(split_bins, int)):
         if split_mode == 'Data':
             split_bins = [np.percentile(split_data, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
-
         elif split_mode == 'Residuals':
-            split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+            split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
             split_bins = [np.percentile(split_res, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
+            split_res = lm.calculate_residual(x_data, split_data)
 
+    # Need to compute residuals if split_mode == 'Residuals' is chosen
     elif isinstance(split_bins, (np.ndarray, list, tuple)) & (split_mode == 'Residuals'):
-        split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+        split_res = lm.calculate_residual(x_data, split_data)
 
     # Define dictionary that will contain values that are being plotted
     # First define it to be a dict of dicts whose first level keys are split_bin number
     output_Data = {'Bin' + str(i): {} for i in range(len(split_bins) - 1)}
 
+    # Loop over bins in split_variable
     for i in range(len(split_bins) - 1):
 
         # Mask dataset based on raw value or residuals to select only halos in this bin
         if split_mode == 'Data':
-            split_Mask = (split_data <= split_bins[i + 1]) & (split_data > split_bins[i])
+            split_mask = (split_data <= split_bins[i + 1]) & (split_data > split_bins[i])
         elif split_mode == 'Residuals':
-            split_Mask = (split_res < split_bins[i + 1]) & (split_res > split_bins[i])
+            split_mask = (split_res < split_bins[i + 1]) & (split_res > split_bins[i])
 
-        # Edge case for y_err
-        if y_err is None:
-            y_err_data_in = None
-        else:
-            y_err_data_in = y_err_data[split_Mask]
-
-        # Run KLLR using JUST the subset
-        Fit_Output = lm.fit(x_data[split_Mask], y_data[split_Mask], y_err_data_in, xrange, bins, nBootstrap, fast_calc, verbose)
-
-        x, y = Fit_Output[0], Fit_Output[1]
-        slope, scatter = Fit_Output[3], Fit_Output[4]
-
-        scatter = scatter * Params['scatter_factor']
-
-        # Reshape outputs so code is general even for nBootstrap = 1
-        if nBootstrap == 1: y, slope, scatter = y[None, :], slope[None, :], scatter[None, :]
+        # Run LLR using JUST the subset
+        x, y = lm.fit(x_data[split_mask], y_data[split_mask], xrange=xrange, nbins=nbins)[0:2]
 
         # Format label depending on Data or Residuals mode
         if split_mode == 'Data':
@@ -526,114 +299,41 @@ def Plot_Fit_Summary_Split(df, xlabel, ylabel, split_label, split_bins=[], split
         if xlog: x = 10 ** x
         if ylog: y = 10 ** y
 
-        # Add black line around regular line to improve visibility
-        if black_line: ax[0].plot(x, np.percentile(y, 50, 0), linestyle=linestyle, lw=6, color='k', label="", alpha = alpha)
+        # Add black line first beneath actual line to enhance visibility
+        plt.plot(x, y, lw=6, color = 'k', label="")
+        plt.plot(x, y, lw=3, color = color[i], label=label)
 
-        ax[0].plot(x, np.percentile(y, 50, 0), linestyle=linestyle, lw=3, color=color[i], label = label, alpha = alpha)
-        ax[0].fill_between(x, np.percentile(y, percentile[0], 0), np.percentile(y, percentile[1], 0),
-                           lw=3, color=color[i], alpha = alpha/3.0)
+        # Store data to be outputted later
+        output_Data['Bin' + str(i)]['x'] = x
+        output_Data['Bin' + str(i)]['y'] = y
 
         if show_data:
 
-            # Show raw data only with xrange that the fit was computed for
-            Mask = (x_data >= np.min(x)) & (x_data <= np.max(x))
+            if xlog:
+                x_data_tmp = 10 ** x_data
+            else:
+                x_data_tmp = x_data
+            if ylog:
+                y_data_tmp = 10 ** y_data
+            else:
+                y_data_tmp = y_data
 
-            x_data_show, y_data_show = x_data[Mask & split_Mask], y_data[Mask & split_Mask]
+            #Use the outputted 'x-vals' as min and max range
+            mask = (x_data_tmp <= x[-1]) & (x_data_tmp >= x[0])
 
-            if xlog: x_data_show = 10 ** x_data_show
-            if ylog: y_data_show = 10 ** y_data_show
-            ax[0].scatter(x_data_show, y_data_show, s=30, alpha=alpha / 3.5, color = color[i], label="")
+            # Only display data above our cutoff and of halos within the bins in split_data
+            plt.scatter(x_data_tmp[mask & split_mask], y_data_tmp[mask & split_mask],
+                        s=30, alpha=0.3, color = color[i], label="")
 
-        ax[1].plot(x, np.percentile(slope, 50, 0), linestyle=linestyle, lw=3, color=color[i], alpha = alpha)
-        ax[1].fill_between(x, np.percentile(slope, percentile[0], 0), np.percentile(slope, percentile[1], 0),
-                           alpha = alpha/3.0, label=None, color=color[i])
-
-        ax[2].plot(x, np.percentile(scatter, 50, 0), linestyle=linestyle, lw=3, color=color[i], alpha = alpha)
-        ax[2].fill_between(x, np.percentile(scatter, percentile[0], 0), np.percentile(scatter, percentile[1], 0),
-                           alpha = alpha/3.0, label=None, color=color[i])
-
-        output_Data['Bin' + str(i)]['x']  = x
-
-        output_Data['Bin' + str(i)]['y']  = np.percentile(y, 50, 0)
-        output_Data['Bin' + str(i)]['y-'] = np.percentile(y, percentile[0], 0)
-        output_Data['Bin' + str(i)]['y+'] = np.percentile(y, percentile[1], 0)
-
-        output_Data['Bin' + str(i)]['slope']  = np.percentile(slope, 50, 0)
-        output_Data['Bin' + str(i)]['slope-'] = np.percentile(slope, percentile[0], 0)
-        output_Data['Bin' + str(i)]['slope+'] = np.percentile(slope, percentile[1], 0)
-
-        output_Data['Bin' + str(i)]['scatter']  = np.percentile(scatter, 50, 0)
-        output_Data['Bin' + str(i)]['scatter-'] = np.percentile(scatter, percentile[0], 0)
-        output_Data['Bin' + str(i)]['scatter+'] = np.percentile(scatter, percentile[1], 0)
-
-    ax[0].set_ylabel(labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_ylabel(r"$\beta\,$(%s)" % labels[1],  size=Params['ylabel_fontsize'])
-    ax[2].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[2].set_xlabel(labels[0], size=Params['xlabel_fontsize'])
-    ax[0].legend(fontsize=Params['legend_fontsize'])
+    plt.xlabel(labels[0], size=fontsize.xlabel)
+    plt.ylabel(labels[1], size=fontsize.ylabel)
+    plt.legend(fontsize=fontsize.legend)
 
     return output_Data, ax
 
-
-def Plot_Higher_Moments(df, xlabel, ylabel, y_err = None, bins=25, xrange=None, nBootstrap=100, verbose = True,
-                        kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.], fast_calc = False,
-                        xlog=False, labels=None, color=None, ax=None):
-    '''
-    This function visualizes the third and forth moment of residuals about the best fit curve.
-
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    verbose : boolean
-        Controls the verbosity of the model's output.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+def Plot_Fit_Params(df, xlabel, ylabel, nbins=25, xrange=None, nBootstrap=100,
+                    kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.],
+                    xlog=False, labels=None, color=None, verbose=True, ax=None, ls = '-'):
 
     lm = kllr_model(kernel_type, kernel_width)
 
@@ -642,9 +342,12 @@ def Plot_Higher_Moments(df, xlabel, ylabel, y_err = None, bins=25, xrange=None, 
         fig.subplots_adjust(hspace=0.05)
 
     # Set x_scale to log. Leave y_scale as is.
-    if xlog: ax[1].set_xscale('log')
+    if xlog:
+        ax[0].set_xscale('log')
+        ax[1].set_xscale('log')
 
-    [a.grid(True) for a in ax]
+    ax[0].grid()
+    ax[1].grid()
 
     if labels is None:
         labels = [xlabel, ylabel]
@@ -652,182 +355,328 @@ def Plot_Higher_Moments(df, xlabel, ylabel, y_err = None, bins=25, xrange=None, 
     # Dictionary to store output values
     output_Data = {}
 
-    # Load and Mask data
-    x_data, y_data = df[xlabel].to_numpy(), df[ylabel].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data)
-    x_data, y_data = x_data[Mask], y_data[Mask]
+    # Load and mask data
+    x_data, y_data = np.array(df[xlabel]), np.array(df[ylabel])
 
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data))
 
+    x_data, y_data = x_data[mask], y_data[mask]
+
+    # Generate new arrays to store params in for each Bootstrap realization
+    scatter = np.empty([nBootstrap, nbins])
+    slope = np.empty([nBootstrap, nbins])
+    intercept = np.empty([nBootstrap, nbins])
+
+    if verbose:
+        iterations_list = tqdm(range(nBootstrap))
     else:
-        y_err_data = None
+        iterations_list = range(nBootstrap)
 
-    # xline is always the same regardless of bootstrap so don't need 2D array for it.
-    # yline, slope, and scatter are not needed for plotting in this module
-    function_output = lm.fit(x_data, y_data, y_err_data, xrange, bins, nBootstrap, fast_calc, verbose, True, True)
+    for iBoot in iterations_list:
 
-    x, skew, kurt = function_output[0], function_output[5], function_output[6]
+        # First bootstrap realization is always just raw data
+        if iBoot == 0:
+            xx, yy = x_data, y_data
+        # All other bootstraps have shuffled data
+        else:
+            xx, index = lm.subsample(x_data)
+            yy = y_data[index]
 
-    # Reshape outputs so code is general even for nBootstrap = 1
-    if nBootstrap == 1: skew, kurt = skew[None, :], kurt[None, :]
+        # xline is always the same regardless of bootstrap so don't need 2D array for it.
+        # yline is not needed for plotting in this module so it's a 'dummy' variable
+        xline, yline, intercept[iBoot, :], slope[iBoot, :], scatter[iBoot, :] = lm.fit(xx, yy,
+                                                                                       xrange=xrange,
+                                                                                       nbins=nbins)[:5]
+    if xlog: xline = 10 ** xline
 
-    if xlog: x = 10 ** x
-
-    p = ax[0].plot(x, np.percentile(skew, 50, 0), lw=3, color=color)
+    p = ax[0].plot(xline, np.mean(slope, axis=0), lw=3, color=color, ls = ls)
     color = p[0].get_color()
-    ax[0].fill_between(x, np.percentile(skew, percentile[0], 0), np.percentile(skew, percentile[1], 0),
-                     alpha=0.4, label=None, color=color)
-
-    ax[1].plot(x, np.percentile(kurt, 50, 0), lw=3, color=color)
-    ax[1].fill_between(x, np.percentile(kurt, percentile[0], 0), np.percentile(kurt, percentile[1], 0),
-                     alpha=0.4, label=None, color=color)
+    ax[0].fill_between(xline, np.percentile(slope, percentile[0], axis=0), np.percentile(slope, percentile[1], axis=0),
+                       alpha=0.4, label=None, color=color)
+    ax[1].plot(xline, np.mean(scatter, axis=0) * Ln10, lw=3, color=color, ls = ls)
+    ax[1].fill_between(xline, np.percentile(scatter, percentile[0], axis=0) * Ln10, np.percentile(scatter, percentile[1], axis=0) * Ln10,
+                       alpha=0.4, label=None, color=color)
 
     # Output Data
-    output_Data['x'] = x
+    output_Data['x'] = xline
 
-    output_Data['skew']  = np.median(skew, axis=0)
-    output_Data['skew-'] = np.percentile(skew, percentile[0], axis=0)
-    output_Data['skew+'] = np.percentile(skew, percentile[1], axis=0)
+    output_Data['slope'] = np.median(slope, axis=0)
+    output_Data['slope-'] = np.percentile(slope, percentile[0], axis=0)
+    output_Data['slope+'] = np.percentile(slope, percentile[1], axis=0)
 
-    output_Data['kurt']  = np.median(kurt, axis=0)
-    output_Data['kurt-'] = np.percentile(kurt, percentile[0], axis=0)
-    output_Data['kurt+'] = np.percentile(kurt, percentile[1], axis=0)
+    # Output data for scatter (in ln terms)
+    output_Data['scatter'] = np.median(scatter, axis=0) * Ln10
+    output_Data['scatter-'] = np.percentile(scatter, percentile[0], axis=0) * Ln10
+    output_Data['scatter+'] = np.percentile(scatter, percentile[1], axis=0) * Ln10
 
-    ax[0].axhline(0, lw = 3, color = 'k', alpha = 0.05)
-    ax[1].axhline(3, lw = 3, color = 'k', alpha = 0.05)
-
-    ax[0].set_ylabel(r"$\gamma\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_ylabel(r"$\kappa\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_xlabel(labels[0], size=Params['xlabel_fontsize'])
+    ax[1].set_xlabel(labels[0], size=fontsize.xlabel)
+    ax[0].set_ylabel(r"$\alpha\,$(%s)" % labels[1], size=fontsize.ylabel)
+    ax[1].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=fontsize.ylabel)
 
     return output_Data, ax
 
+def Plot_Fit_Summary(df, xlabel, ylabel, nbins=25, xrange=None, nBootstrap=100, show_data=False,
+                    kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.], ls = '-',
+                    xlog=False, ylog = False, labels=None, color=None, verbose=True, ax=None):
 
-def Plot_Higher_Moments_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mode='Data', y_err = None, bins=25,
-                              xrange=None, nBootstrap=100, verbose = True, kernel_type='gaussian', kernel_width=0.2, fast_calc = False,
-                              xlog=False, percentile=[16., 84.], color=None, labels=None, cmap = None, ax=None):
-    '''
-    This function stratifies data on split variable and then visualizes
-        the third and forth moment of residuals about the best fit curve.
+    lm = kllr_model(kernel_type, kernel_width)
 
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
+    if ax is None:
+        fig, ax = plt.subplots(3, figsize=(12, 19), sharex=True,
+                               gridspec_kw={'height_ratios': [1.75, 1, 1]})
+        fig.subplots_adjust(hspace=0.05)
 
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
+    # Set x_scale to log. Leave y_scale as is.
+    if xlog:
+        ax[0].set_xscale('log')
+        ax[1].set_xscale('log')
+        ax[2].set_xscale('log')
 
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
+    if ylog:
+        ax[0].set_yscale('log')
 
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
+    ax[0].grid()
+    ax[1].grid()
+    ax[2].grid()
 
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
+    if labels is None:
+        labels = [xlabel, ylabel]
 
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
+    # Dictionary to store output values
+    output_Data = {}
 
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
+    # Load and mask data
+    x_data, y_data = np.array(df[xlabel]), np.array(df[ylabel])
 
-    split_label : str
-        Label of the data vector used to split the data, or condition the data, on a secondary variable.
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data))
 
-    split_bins : int, list, tuple, numpy array
-        Can be either number of bins (int), or array of bin_edges.
+    x_data, y_data = x_data[mask], y_data[mask]
 
-        If an int is provided the modules will determine the bin edges themselves using the data vector.
-        By default, edges are set so there are equal number of data points in each bin.
-        Note that the bin edges in this case will be determined using all data passed into the function. However,
-        the plotting and computations will be done only using data with x-values within the bounds set by the xrange parameter.
+    # Generate new arrays to store params in for each Bootstrap realization
+    yline   = np.empty([nBootstrap, nbins])
+    scatter = np.empty([nBootstrap, nbins])
+    slope   = np.empty([nBootstrap, nbins])
+    intercept = np.empty([nBootstrap, nbins])
 
-        If a list is provided then the list elements serve as the bin edges
+    if verbose:
+        iterations_list = tqdm(range(nBootstrap))
+    else:
+        iterations_list = range(nBootstrap)
 
-    split_mode : str
+    for iBoot in iterations_list:
 
-        Sets how the data is split/conditioned based on the split variable
-        If 'Data', then all halos are binned based on the variable df[split_label]
-        If 'Residuals', then we fit split_label vs. xlabel, then split the data into bins based on the residual values
+        # First bootstrap realization is always just raw data
+        if iBoot == 0:
+            xx, yy = x_data, y_data
+        # All other bootstraps have shuffled data
+        else:
+            xx, index = lm.subsample(x_data)
+            yy = y_data[index]
 
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
+        # xline is always the same regardless of bootstrap so don't need 2D array for it.
+        # yline is not needed for plotting in this module so it's a 'dummy' variable
+        xline, yline[iBoot, :], intercept[iBoot, :], slope[iBoot, :], scatter[iBoot, :] = lm.fit(xx, yy,
+                                                                                                 xrange=xrange,
+                                                                                                 nbins=nbins)[:5]
 
-    verbose : boolean
-        Controls the verbosity of the model's output.
+    if xlog: xline = 10 ** xline
+    if ylog: yline = 10 ** yline
 
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
+    # Add black line around regular line to improve visibility
+    ax[0].plot(xline, np.e**np.median(np.log(yline), axis = 0), lw=6, color = 'k', label="", ls = ls)
+    p = ax[0].plot(xline, np.e**np.median(np.log(yline), axis = 0), lw=3, color = color, ls = ls)
+    color = p[0].get_color()
 
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
+    if show_data:
 
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
+        #Generate Mask so raw data is shown only for values of x_data within xrange
+        if xrange == None:
+            #If no xrange inputted, mask selected all available data
+            Mask = np.ones(x_data.size, bool)
+        else:
+            Mask = (x_data > xrange[0]) & (x_data < xrange[1])
 
+        x_data, y_data = x_data[Mask], y_data[Mask]
 
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+        if xlog: x_data = 10 ** x_data
+        if ylog: y_data = 10 ** y_data
+        ax[0].scatter(x_data, y_data, s=30, alpha=0.3, color = color, label="")
 
-    check_attributes(split_bins=split_bins, split_mode=split_mode)
+    ax[0].set_ylabel(labels[1], size=fontsize.ylabel)
 
-    lm    = kllr_model(kernel_type, kernel_width)
-    color = setup_color(color, split_bins, cmap)
+    ax[1].plot(xline, np.median(slope, axis=0), lw=3, color=color, ls = ls)
+    ax[1].fill_between(xline, np.percentile(slope, percentile[0], axis=0), np.percentile(slope, percentile[1], axis=0),
+                       alpha=0.4, label=None, color=color)
+
+    if ylog:
+        ax[2].plot(xline, np.median(scatter, axis=0) * Ln10, lw=3, color=color, ls = ls)
+        ax[2].fill_between(xline, np.percentile(scatter, percentile[0], axis=0) * Ln10, np.percentile(scatter, percentile[1], axis=0) * Ln10,
+                           alpha=0.4, label=None, color=color)
+    else:
+        ax[2].plot(xline, np.median(scatter, axis=0), lw=3, color=color, ls = ls)
+        ax[2].fill_between(xline, np.percentile(scatter, percentile[0], axis=0), np.percentile(scatter, percentile[1], axis=0),
+                           alpha=0.4, label=None, color=color)
+
+    ax[2].set_xlabel(labels[0], size=fontsize.xlabel)
+    ax[1].set_ylabel(r"$\alpha\,$(%s)" % labels[1], size=fontsize.ylabel)
+    ax[2].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=fontsize.ylabel)
+
+    output_Data['x']  = xline
+
+    if ylog:
+        output_Data['y']  = np.e**np.median(np.log(yline), axis = 0)
+        output_Data['y-'] = np.e**np.percentile(np.log(yline), percentile[0], axis=0)
+        output_Data['y+'] = np.e**np.percentile(np.log(yline), percentile[1], axis=0)
+    else:
+        output_Data['y']  = np.median(yline, axis = 0)
+        output_Data['y-'] = np.percentile(yline, percentile[0], axis=0)
+        output_Data['y+'] = np.percentile(yline, percentile[1], axis=0)
+
+    output_Data['slope']  = np.median(slope, axis=0)
+    output_Data['slope-'] = np.percentile(slope, percentile[0], axis=0)
+    output_Data['slope+'] = np.percentile(slope, percentile[1], axis=0)
+
+    # Output data for scatter (in ln terms)
+    output_Data['scatter']  = np.median(scatter, axis=0) * Ln10
+    output_Data['scatter-'] = np.percentile(scatter, percentile[0], axis=0) * Ln10
+    output_Data['scatter+'] = np.percentile(scatter, percentile[1], axis=0) * Ln10
+
+    return output_Data, ax
+
+def Plot_Multivariate_Fit_Params(df, xlabels, ylabel, nbins=25, xrange=None, nBootstrap=100, show_all_slopes = False,
+                                 kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.],
+                                 xlog=False, labels=None, color=None, verbose=True, ax=None):
+
+    lm = kllr_model(kernel_type, kernel_width)
 
     if ax is None:
         fig, ax = plt.subplots(2, figsize=(12, 10), sharex=True)
         fig.subplots_adjust(hspace=0.05)
 
     # Set x_scale to log. Leave y_scale as is.
-    if xlog: ax[1].set_xscale('log')
+    if xlog:
+        ax[0].set_xscale('log')
+        ax[1].set_xscale('log')
 
-    [a.grid(True) for a in ax]
+    ax[0].grid()
+    ax[1].grid()
 
     if labels is None:
-        labels = [xlabel, ylabel, split_label]
+        labels = [xlabels[0], ylabel]
 
     # Dictionary to store output values
     output_Data = {}
 
-    # Load and Mask data
-    x_data, y_data, split_data = df[xlabel].to_numpy(), df[ylabel].to_numpy(), df[split_label].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data) & clean_vector(split_data)
-    x_data, y_data, split_data = x_data[Mask], y_data[Mask], split_data[Mask]
+    # Load and mask data
+    X_data, y_data = df[xlabels].to_numpy(), np.array(df[ylabel])
 
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
+    # mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data))
+    #
+    # x_data, y_data = x_data[mask], y_data[mask]
 
+    # Generate new arrays to store params in for each Bootstrap realization
+    scatter = np.empty([nBootstrap, nbins])
+    slope = np.empty([nBootstrap, nbins, X_data.shape[1]])
+
+    if verbose:
+        iterations_list = tqdm(range(nBootstrap))
     else:
-        y_err_data = None
+        iterations_list = range(nBootstrap)
+
+    for iBoot in iterations_list:
+
+        # First bootstrap realization is always just raw data
+        if iBoot == 0:
+            xx, yy = X_data, y_data
+        # All other bootstraps have shuffled data
+        else:
+            index = lm.subsample(X_data[:, 0])[1]
+            xx = X_data[index, :]
+            yy = y_data[index]
+
+        # xline is always the same regardless of bootstrap so don't need 2D array for it.
+        # yline is not needed for plotting in this module so it's a 'dummy' variable
+        xline, slope[iBoot, :, :], scatter[iBoot, :], _ = lm.multivariate_fit(xx, yy, xrange=xrange, nbins=nbins)
+
+    if xlog: xline = 10 ** xline
+
+    for i in range(X_data.shape[1]):
+
+        if (not show_all_slopes) and (i > 0): break
+        p = ax[0].plot(xline, np.mean(slope[:, :, i], axis=0), lw=3, color=color,
+                       alpha = 1 - i/X_data.shape[1]*0.8 if show_all_slopes else 1)
+        color = p[0].get_color()
+        ax[0].fill_between(xline, np.percentile(slope[:, :, i], percentile[0], axis=0),
+                           np.percentile(slope[:, :, i], percentile[1], axis=0),
+                           alpha=0.4, label=None, color=color)
+    ax[1].plot(xline, np.mean(scatter, axis=0) * Ln10, lw=3, color=color)
+    ax[1].fill_between(xline, np.percentile(scatter, percentile[0], axis=0) * Ln10, np.percentile(scatter, percentile[1], axis=0) * Ln10,
+                       alpha=0.4, label=None, color=color)
+
+    # Output Data
+    output_Data['x'] = xline
+
+    for i in range(X_data.shape[1]):
+        output_Data['slope' + str(i)] = np.median(slope[:, :, i], axis=0)
+        output_Data['slope' + str(i) + '-'] = np.percentile(slope[:, :, i], percentile[0], axis=0)
+        output_Data['slope' + str(i) + '+'] = np.percentile(slope[:, :, i], percentile[1], axis=0)
+
+    # Output data for scatter (in ln terms)
+    output_Data['scatter'] = np.median(scatter, axis=0) * Ln10
+    output_Data['scatter-'] = np.percentile(scatter, percentile[0], axis=0) * Ln10
+    output_Data['scatter+'] = np.percentile(scatter, percentile[1], axis=0) * Ln10
+
+    ax[1].set_xlabel(labels[0], size=fontsize.xlabel)
+    ax[0].set_ylabel(r"$\alpha\,$(%s)" % labels[1], size=fontsize.ylabel)
+    ax[1].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=fontsize.ylabel)
+
+    return output_Data, ax
+
+def Plot_Fit_Params_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mode='Data', nbins=25,
+                          xrange=None, nBootstrap=100, kernel_type='gaussian', kernel_width=0.2,
+                          xlog=False, percentile=[16., 84.], color=None, labels=None, verbose=True, ax=None):
+
+    check_attributes(split_bins=split_bins, split_mode=split_mode)
+
+    lm = kllr_model(kernel_type, kernel_width)
+
+    if ax is None:
+        fig, ax = plt.subplots(2, figsize=(12, 10), sharex=True)
+        fig.subplots_adjust(hspace=0.05)
+
+    color = setup_color(color, split_bins, cmap=None)
+
+    ax[0].grid()
+    ax[1].grid()
+
+    # Set x_scale to log. Leave y_scale as is.
+    if xlog:
+        ax[0].set_xscale('log')
+        ax[1].set_xscale('log')
+
+    if labels is None:
+        labels = [xlabel, ylabel, split_label]
+
+    # Load data and mask it
+    x_data, y_data, split_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[split_label])
+
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data)) & np.invert(np.isinf(split_data))
+
+    x_data, y_data, split_data = x_data[mask], y_data[mask], split_data[mask]
 
     # Choose bin edges for binning data
     if (isinstance(split_bins, int)):
         if split_mode == 'Data':
             split_bins = [np.percentile(split_data, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
         elif split_mode == 'Residuals':
-            split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+            split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
             split_bins = [np.percentile(split_res, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
+
+            split_res = lm.calculate_residual(x_data, split_data)
 
     # Need to compute residuals if split_mode == 'Residuals' is chosen
     elif isinstance(split_bins, (np.ndarray, list, tuple)) & (split_mode == 'Residuals'):
-        split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+        split_res = lm.calculate_residual(x_data, split_data)
 
     # Define Output_Data variable to store all computed data that is then plotted
     output_Data = {'Bin' + str(i): {} for i in range(len(split_bins) - 1)}
@@ -835,125 +684,216 @@ def Plot_Higher_Moments_Split(df, xlabel, ylabel, split_label, split_bins=[], sp
     for i in range(len(split_bins) - 1):
 
         if split_mode == 'Data':
-            split_Mask = (split_data <= split_bins[i + 1]) & (split_data > split_bins[i])
+            split_mask = (split_data <= split_bins[i + 1]) & (split_data > split_bins[i])
         elif split_mode == 'Residuals':
-            split_Mask = (split_res <= split_bins[i + 1]) & (split_res > split_bins[i])
+            split_mask = (split_res <= split_bins[i + 1]) & (split_res > split_bins[i])
 
+        scatter = np.empty([nBootstrap, nbins])
+        slope = np.empty([nBootstrap, nbins])
+        intercept = np.empty([nBootstrap, nbins])
 
-        #Edge case for y_err
-        if y_err is None:
-            y_err_data_in = None
+        sorted_array = np.sort(x_data[split_mask])
+        xrange_temp = [np.max([sorted_array[20], xrange[0]]),
+                       np.min([sorted_array[-20], xrange[1]])]
+
+        if verbose:
+            iterations_list = tqdm(range(nBootstrap))
         else:
-            y_err_data_in = y_err_data[split_Mask]
+            iterations_list = range(nBootstrap)
 
-        function_output = lm.fit(x_data[split_Mask], y_data[split_Mask], y_err_data_in,
-                                 xrange, bins, nBootstrap, fast_calc, verbose, True, True)
-        x, skew, kurt = function_output[0], function_output[5], function_output[6]
+        for iBoot in iterations_list:
 
-        # Reshape outputs so code is general even for nBootstrap = 1
-        if nBootstrap == 1: skew, kurt = skew[None, :], kurt[None, :]
+            # First bootstrap realization is always just raw data
+            if iBoot == 0:
+                xx, yy = x_data[split_mask], y_data[split_mask]
+            # All other bootstraps have shuffled data
+            else:
+                xx, index = lm.subsample(x_data[split_mask])
+                yy = y_data[split_mask][index]
 
+            xline, yline, intercept[iBoot, :], \
+            slope[iBoot, :], scatter[iBoot, :] = lm.fit(xx, yy, xrange=xrange_temp, nbins=nbins)[:5]
 
         if split_mode == 'Data':
             label = r'$%0.2f <$ %s $< %0.2f$' % (split_bins[i], labels[2], split_bins[i + 1])
         elif split_mode == 'Residuals':
             label = r'$%0.2f < {\rm res}($%s$) < %0.2f$' % (split_bins[i], labels[2], split_bins[i + 1])
 
-        if xlog: x = 10 ** x
+        if xlog: xline = 10 ** xline
 
-        ax[0].plot(x, np.percentile(skew, 50, 0), lw=3, color=color[i], label = label)
-        ax[0].fill_between(x, np.percentile(skew, percentile[0], 0), np.percentile(skew, percentile[1], 0),
-                         alpha=0.4, label=None, color=color[i])
+        ax[0].plot(xline, np.median(slope, axis=0), lw=3, label=label, color=color[i])
+        ax[0].fill_between(xline, np.percentile(slope, percentile[0], axis=0), np.percentile(slope, percentile[1], axis=0),
+                           alpha=0.4, label=None, color=color[i])
 
-        ax[1].plot(x, np.percentile(kurt, 50, 0), lw=3, color=color[i])
-        ax[1].fill_between(x, np.percentile(kurt, percentile[0], 0), np.percentile(kurt, percentile[1], 0),
-                         alpha=0.4, label=None, color=color[i])
+        # Divide scatter by log10(e) to get it in ln terms (not log10 terms)
+        ax[1].plot(xline, np.median(scatter, axis=0) * Ln10, lw=3, label=label, color=color[i])
+        ax[1].fill_between(xline,
+                           np.percentile(scatter, percentile[0], axis=0) * Ln10,
+                           np.percentile(scatter, percentile[1], axis=0) * Ln10,
+                           alpha=0.4, label=None, color=color[i])
 
-        # Output Data
-        output_Data['Bin' + str(i)]['x'] = x
+        # Output xvals
+        output_Data['Bin' + str(i)]['x'] = xline
 
-        output_Data['Bin' + str(i)]['skew']  = np.median(skew, axis=0)
-        output_Data['Bin' + str(i)]['skew-'] = np.percentile(skew, percentile[0], axis=0)
-        output_Data['Bin' + str(i)]['skew+'] = np.percentile(skew, percentile[1], axis=0)
+        # Output data for slope
+        output_Data['Bin' + str(i)]['slope'] = np.median(slope, axis=0)
+        output_Data['Bin' + str(i)]['slope-'] = np.percentile(slope, percentile[0], axis=0)
+        output_Data['Bin' + str(i)]['slope+'] = np.percentile(slope, percentile[1], axis=0)
 
-        output_Data['Bin' + str(i)]['kurt']  = np.median(kurt, axis=0)
-        output_Data['Bin' + str(i)]['kurt-'] = np.percentile(kurt, percentile[0], axis=0)
-        output_Data['Bin' + str(i)]['kurt+'] = np.percentile(kurt, percentile[1], axis=0)
+        # Output data for scatter (in ln terms)
+        output_Data['Bin' + str(i)]['scatter'] = np.median(scatter, axis=0) * Ln10
+        output_Data['Bin' + str(i)]['scatter-'] = np.percentile(scatter, percentile[0], axis=0) * Ln10
+        output_Data['Bin' + str(i)]['scatter+'] = np.percentile(scatter, percentile[1], axis=0) * Ln10
 
-    ax[0].axhline(0, lw = 3, color = 'k', alpha = 0.05)
-    ax[1].axhline(3, lw = 3, color = 'k', alpha = 0.05)
-
-    ax[0].set_ylabel(r"$\gamma\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_ylabel(r"$\kappa\,$(%s)" % labels[1], size=Params['ylabel_fontsize'])
-    ax[1].set_xlabel(labels[0], size=Params['xlabel_fontsize'])
-    ax[0].legend(fontsize=Params['legend_fontsize'])
+    ax[1].set_xlabel(labels[0], size=fontsize.xlabel)
+    ax[0].set_ylabel(r"$\alpha\,$(%s)" % labels[1], size=fontsize.ylabel)
+    ax[1].set_ylabel(r"$\sigma\,$(%s)" % labels[1], size=fontsize.ylabel)
+    ax[1].legend(fontsize=fontsize.legend)
 
     return output_Data, ax
 
-
-def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=None, nBootstrap=100, verbose = True,
-                         Output_mode='Covariance', kernel_type='gaussian', kernel_width=0.2,
-                         percentile=[16., 84.], xlog=False, labels=None, color=None, fast_calc = False,
-                         ax=None):
-    '''
-    This function visualizes estimated local correlation coefficient or
-    the covariance between a set of variables.
-
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    verbose : boolean
-        Controls the verbosity of the model's output.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+def Plot_Cov_Corr(df, xlabel, ylabel, zlabel, nbins=25, xrange=None, nBootstrap=100,
+                  Output_mode='Covariance', kernel_type='gaussian', kernel_width=0.2,
+                  percentile=[16., 84.], xlog=False, labels=None, color=None,
+                  verbose=True, ax=None):
 
     check_attributes(Output_mode=Output_mode)
+
+    lm = kllr_model(kernel_type, kernel_width)
+
+    #Dictionary to store values
+    output_Data = {}
+
+    if ax == None:
+        ax = plt.figure(figsize = (12,8))
+
+    if (labels is None) or (len(labels) < 3):
+        labels = [xlabel, ylabel, zlabel]
+
+    #Load x-vals just so we can set xrange and xline
+
+    if xrange == None:
+        x_data = np.array(df[xlabel])
+        xrange = (np.min(x) - 0.01, np.max(x) + 0.01)
+    elif xrange[0] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[0] = np.min(x) - 0.01
+    elif xrange[1] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[1] = np.max(x) + 0.01
+
+    xline = np.linspace(xrange[0], xrange[1], nbins, endpoint=True)
+
+    if verbose:
+        iterations_list = tqdm(range(len(xline)))
+    else:
+        iterations_list = range(len(xline))
+
+    if kernel_width is None:
+        kernel_width = self.kernel_width
+
+    #If kernel_width is just one number, then turn it
+    #into an array of length = nbins
+    if isinstance(kernel_width, (int, float)):
+        kernel_width_array = np.ones(nbins)*kernel_width
+
+    elif len(kernel_width) != len(xline):
+        #Check if kernel_width has right dimensions
+        raise ValueError("Size mismatch: kernel_width has length %d. Paramater nbins = %d"%(len(kernel_width), nbins))
+    #Otherwise rename value for rest of code
+    else:
+        kernel_width_array = kernel_width
+
+    x_data, y_data, z_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[zlabel])
+    mask = np.invert(np.isinf(x_data)) & (np.invert(np.isinf(y_data))) & (np.invert(np.isinf(z_data)))
+    x_data, y_data, z_data = x_data[mask], y_data[mask], z_data[mask]
+
+    cov_corr = np.zeros([nBootstrap, len(xline)])
+
+    for k in iterations_list:
+
+        #Add mask to reduce data and improve
+        #efficiency (hopefully)
+        x_Mask = (x_data > xline[k] - 3*kernel_width_array[k]) & (x_data < xline[k] + 3*kernel_width_array[k])
+
+        x_masked, y_masked, z_masked = x_data[x_Mask], y_data[x_Mask], z_data[x_Mask]
+
+        if Output_mode.lower() in ['covariance', 'cov']:
+            cov_corr[:, k] = lm.calc_covariance_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                        kernel_width=kernel_width_array[k],
+                                                        parametric_bootstrap = True,
+                                                        nBootstrap = nBootstrap)
+        elif Output_mode.lower() in ['correlation', 'corr']:
+            cov_corr[:, k] = lm.calc_correlation_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                         kernel_width=kernel_width_array[k],
+                                                         parametric_bootstrap = True,
+                                                         nBootstrap = nBootstrap)
+
+    output_Data['x'] = xline
+
+    if Output_mode.lower() in ['covariance', 'cov']:
+        name = 'cov'
+    elif Output_mode.lower() in ['correlation', 'corr']:
+        name = 'corr'
+
+    output_Data['%s_%s_%s'%(name, ylabel, zlabel)]  = np.median(cov_corr, axis=0)
+    output_Data['%s_%s_%s-'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[0], axis=0)
+    output_Data['%s_%s_%s+'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[1], axis=0)
+
+    if xlog: plt.xscale('log')
+
+    if xlog:
+        xline_temp = 10 ** (xline)
+    else:
+        xline_temp = xline
+
+    p = plt.plot(xline_temp, np.mean(cov_corr, axis=0), lw=3, color=color)
+    color = p[0].get_color()
+    plt.fill_between(xline_temp, np.percentile(cov_corr, percentile[0], axis=0),
+                        np.percentile(cov_corr, percentile[1], axis=0), alpha=0.4, label=None, color=color)
+    plt.grid()
+
+    if Output_mode.lower() in ['correlation', 'corr']:
+        plt.axhline(y=0.0, color='k', lw=2)
+        plt.ylim(ymin=-1, ymax=1)
+
+    if Output_mode.lower() in ['correlation', 'corr']:
+        plt.ylabel(r'r(%s-%s)'%(labels[1], labels[2]), size=fontsize.ylabel)
+    else:
+        plt.ylabel(r'cov(%s-%s)'%(labels[1], labels[2]), size=fontsize.ylabel)
+
+    plt.xlabel(labels[0], size=fontsize.xlabel)
+
+    return output_Data, ax
+
+def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, nbins=25, xrange=None, nBootstrap=100,
+                         Output_mode='Covariance', kernel_type='gaussian', kernel_width=0.2,
+                         percentile=[16., 84.], xlog=False, labels=None, color=None,
+                         verbose=True, ax=None, c200c_offset = 1, ls = '-'):
+
+    check_attributes(Output_mode=Output_mode)
+
+    from scipy import interpolate
+
+    def N_Sigma_Filter(x_data, y_data, N_sigma = 5, xrange = None):
+
+        if xrange == None:
+
+            xrange = (np.min(x_data), np.max(x_data))
+
+        model = kllr_model()
+        x, y, pi, alpha, eps = model.fit(x_data, y_data, kernel_width=0.2, nbins=50, xrange=xrange)
+
+        scatter  = interpolate.UnivariateSpline(x, eps, k = 1)
+
+        mean_val = interpolate.UnivariateSpline(x, y, k = 1)
+
+        upper_bound = mean_val(x_data) + N_sigma*scatter(x_data)
+        lower_bound = mean_val(x_data) - N_sigma*scatter(x_data)
+
+        Mask = (y_data > lower_bound) & (y_data < upper_bound)
+
+        return Mask
 
     lm = kllr_model(kernel_type, kernel_width)
 
@@ -989,7 +929,13 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
                 ax[i, j].axis('off')
 
     if labels is None:
+        ylabels.sort()
         labels = [xlabel] + ylabels
+    else:
+        None
+        # Sort ylabels alphabetically but make sure we also sort the label list (if provided) in sync
+        # ylabels, temp = zip(*sorted(zip(ylabels, labels[1:])))
+        # ylabels, labels[1:] = list(ylabels), list(temp)
 
     col = -1
 
@@ -997,6 +943,35 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
         iterations_list = tqdm(ylabels)
     else:
         iterations_list = ylabels
+
+    #Load x-vals just so we can set xrange and xline
+
+    if xrange == None:
+        x_data = np.array(df[xlabel])
+        xrange = (np.min(x) - 0.01, np.max(x) + 0.01)
+    elif xrange[0] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[0] = np.min(x) - 0.01
+    elif xrange[1] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[1] = np.max(x) + 0.01
+
+    xline_true = np.linspace(xrange[0], xrange[1], nbins, endpoint=True)
+
+    if kernel_width is None:
+        kernel_width = self.kernel_width
+
+    #If kernel_width is just one number, then turn it
+    #into an array of length = nbins
+    if isinstance(kernel_width, (int, float)):
+        kernel_width_array = np.ones(nbins)*kernel_width
+
+    elif len(kernel_width) != len(xline_true):
+        #Check if kernel_width has right dimensions
+        raise ValueError("Size mismatch: kernel_width has length %d. Paramater nbins = %d"%(len(kernel_width), nbins))
+    #Otherwise rename value for rest of code
+    else:
+        kernel_width_array = kernel_width
 
     for ylabel in iterations_list:
 
@@ -1015,43 +990,65 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
                 if j <= i:
                     continue
 
-            x_data, y_data, z_data = df[xlabel].to_numpy(), df[ylabel].to_numpy(), df[zlabel].to_numpy()
-            Mask = clean_vector(x_data) & clean_vector(y_data) & clean_vector(z_data)
-            x_data, y_data, z_data = x_data[Mask], y_data[Mask], z_data[Mask]
+            with np.errstate(invalid = 'ignore'):
+                x_data, y_data, z_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[zlabel])
+                mask = ((x_data > -1e10) & (x_data < 1e10) &
+                        (y_data > -1e10) & (y_data < 1e10) &
+                        (z_data > -1e10) & (z_data < 1e10))
+                x_data, y_data, z_data = x_data[mask], y_data[mask], z_data[mask]
 
-            if y_errs is None:
-                y_err_data = None
-                z_err_data = None
+            #Perform filter
+            Mask_y = N_Sigma_Filter(x_data, y_data, 3,
+                                    xrange = [xrange[0] + c200c_offset, xrange[1]] if 'c200c' in ylabel else None)
+            Mask_z = N_Sigma_Filter(x_data, z_data, 3,
+                                    xrange = [xrange[0] + c200c_offset, xrange[1]] if 'c200c' in zlabel else None)
+
+            if ('c200c' not in ylabel) & ('E_s_DMO' not in ylabel): Mask_y = np.ones(Mask_y.size).astype(bool)
+            if ('c200c' not in zlabel) & ('E_s_DMO' not in ylabel): Mask_z = np.ones(Mask_z.size).astype(bool)
+
+            x_data, y_data, z_data = x_data[Mask_y & Mask_z], y_data[Mask_y & Mask_z], z_data[Mask_y & Mask_z]
+
+            if ('c200c' in ylabel) or ('c200c' in zlabel):
+                xline = np.linspace(xrange[0] + c200c_offset, xrange[1], nbins, endpoint=True)
+
+                from scipy import interpolate
+                kernel_here = interpolate.interp1d(np.linspace(xrange[0], xrange[1], nbins, endpoint=True),
+                                                   kernel_width_array)(xline)
+
             else:
-                if isinstance(y_errs[i], str):
-                    y_err_data = df[y_errs[i]].to_numpy()[Mask]
-                else:
-                    y_err_data = None
+                xline = xline_true
+                kernel_here = kernel_width_array
+            cov_corr = np.zeros([nBootstrap, len(xline)])
 
-                if isinstance(y_errs[j], str):
-                    z_err_data = df[y_errs[j]].to_numpy()[Mask]
-                else:
-                    z_err_data = None
+            for k in range(len(xline)):
 
-            if Output_mode.lower() in ['covariance', 'cov']:
-                x, cov_corr = lm.covariance(x_data, y_data, z_data, y_err_data, z_err_data, xrange, bins, nBootstrap, fast_calc)
-                cov_corr    = cov_corr * Params['scatter_factor']**2
+                #Add mask to reduce data and improve
+                #efficiency (hopefully)
+                x_Mask = (x_data > xline[k] - 3*kernel_here[k]) & (x_data < xline[k] + 3*kernel_here[k])
 
-            elif Output_mode.lower() in ['correlation', 'corr']:
-                x, cov_corr = lm.correlation(x_data, y_data, z_data, y_err_data, z_err_data, xrange, bins, nBootstrap, fast_calc)
+                x_masked, y_masked, z_masked = x_data[x_Mask], y_data[x_Mask], z_data[x_Mask]
 
-            if nBootstrap == 1: cov_corr = cov_corr[None, :]
+                if Output_mode.lower() in ['covariance', 'cov']:
+                    cov_corr[:, k] = lm.calc_covariance_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                                kernel_width=kernel_here[k],
+                                                                parametric_bootstrap = True,
+                                                                nBootstrap = nBootstrap)
+                elif Output_mode.lower() in ['correlation', 'corr']:
+                    cov_corr[:, k] = lm.calc_correlation_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                                 kernel_width=kernel_here[k],
+                                                                 parametric_bootstrap = True,
+                                                                 nBootstrap = nBootstrap)
 
-            output_Data['x'] = x
+            output_Data['x'] = xline
 
             if Output_mode.lower() in ['covariance', 'cov']:
                 name = 'cov'
             elif Output_mode.lower() in ['correlation', 'corr']:
                 name = 'corr'
 
-            output_Data['%s_%s_%s'%(name, ylabel, zlabel)]  = np.percentile(cov_corr, 50, 0)
-            output_Data['%s_%s_%s-'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[0], 0)
-            output_Data['%s_%s_%s+'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[1], 0)
+            output_Data['%s_%s_%s'%(name, ylabel, zlabel)]  = np.median(cov_corr, axis=0)
+            output_Data['%s_%s_%s-'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[0], axis=0)
+            output_Data['%s_%s_%s+'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[1], axis=0)
 
             if matrix_size > 1:
                 ax_tmp = ax[row, col]
@@ -1061,13 +1058,16 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
             if xlog: ax_tmp.set_xscale('log')
             ax_tmp.axis('on')
 
-            if xlog: x = 10 ** (x)
+            if xlog:
+                xline_temp = 10 ** (xline)
+            else:
+                xline_temp = xline
 
-            p = ax_tmp.plot(x, np.median(cov_corr, axis=0), lw=3, color=color)
+            p = ax_tmp.plot(xline_temp, np.mean(cov_corr, axis=0), lw=3, color=color, ls = ls)
             color = p[0].get_color()
-            ax_tmp.fill_between(x, np.percentile(cov_corr, percentile[0], axis=0),
+            ax_tmp.fill_between(xline_temp, np.percentile(cov_corr, percentile[0], axis=0),
                                 np.percentile(cov_corr, percentile[1], axis=0), alpha=0.4, label=None, color=color)
-            ax_tmp.grid(True)
+            ax_tmp.grid()
 
             if Output_mode.lower() in ['correlation', 'corr']:
                 ax_tmp.axhline(y=0.0, color='k', lw=2)
@@ -1075,26 +1075,27 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
 
             if col == row:
 
-                # Remove any text that exists already
+                #Remove any text that exists already
                 for text in ax_tmp.texts:
                     text.set_visible(False)
 
-                ax_tmp.text(1.02, 0.5, labels[1 + j], size=Params['ylabel_fontsize'],
-                            horizontalalignment='left', verticalalignment='center', rotation=270, clip_on=False,
+                ax_tmp.text(1.02, 0.5, labels[1 + j], size=fontsize.ylabel,
+                            verticalalignment='center', rotation=270,
                             transform=ax_tmp.transAxes)
+
             if row == col:
-                ax_tmp.set_title(labels[1 + i], size=Params['xlabel_fontsize'], pad = 15)
+                ax_tmp.set_title(labels[1 + i], size=fontsize.xlabel)
 
             if row == matrix_size - 1:
-                ax_tmp.set_xlabel(labels[0], size=Params['xlabel_fontsize'])
+                ax_tmp.set_xlabel(labels[0], size=fontsize.xlabel)
 
             if col == 0:
-                if Output_mode.lower() in ['covariance', 'cov']:
-                    ax_tmp.set_ylabel('cov', size=Params['xlabel_fontsize'])
-                elif Output_mode.lower() in ['correlation', 'corr']:
-                    ax_tmp.set_ylabel('r', size=Params['xlabel_fontsize'])
+                if Output_mode.lower() in ['correlation', 'corr']:
+                    ax_tmp.set_ylabel('r', size=fontsize.xlabel)
+                else:
+                    ax_tmp.set_ylabel('cov', size=fontsize.xlabel)
 
-            ax_tmp.tick_params(axis='both', which='major')
+            ax_tmp.tick_params(axis='both', which='major', labelsize=12)
 
             row += 1
 
@@ -1103,95 +1104,14 @@ def Plot_Cov_Corr_Matrix(df, xlabel, ylabels, y_errs = None, bins=25, xrange=Non
 
     return output_Data, ax
 
-
-def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], y_errs = None, Output_mode='Covariance',
-                               split_mode='Data', bins=25, xrange=None, nBootstrap=100, verbose = True, fast_calc = False,
+def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], Output_mode='Covariance',
+                               split_mode='Data', nbins=25, xrange=None, nBootstrap=100,
                                kernel_type='gaussian', kernel_width=0.2, xlog=False, percentile=[16., 84.],
-                               labels=None, color=None, ax=None):
-    '''
-    This function stratifies data on split variable and then visualizes
-     estimated local correlation coefficient or the covariance between a set of variables.
-
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    split_label : str
-        Label of the data vector used to split the data, or condition the data, on a secondary variable.
-
-    split_bins : int, list, tuple, numpy array
-        Can be either number of bins (int), or array of bin_edges.
-
-        If an int is provided the modules will determine the bin edges themselves using the data vector.
-        By default, edges are set so there are equal number of data points in each bin.
-        Note that the bin edges in this case will be determined using all data passed into the function. However,
-        the plotting and computations will be done only using data with x-values within the bounds set by the xrange parameter.
-
-        If a list is provided then the list elements serve as the bin edges
-
-    split_mode : str
-
-        Sets how the data is split/conditioned based on the split variable
-        If 'Data', then all halos are binned based on the variable df[split_label]
-        If 'Residuals', then we fit split_label vs. xlabel, then split the data into bins based on the residual values
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    verbose : boolean
-        Controls the verbosity of the model's output.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+                               labels=None, color=None, verbose=True, ax=None):
 
     check_attributes(split_bins=split_bins, Output_mode=Output_mode, split_mode=split_mode)
 
-    lm    = kllr_model(kernel_type, kernel_width)
-    color = setup_color(color, split_bins, cmap=None)
-
-    # Dictionary to store values
-    output_Data = {}
+    lm = kllr_model(kernel_type, kernel_width)
 
     # size of matrix
     if Output_mode.lower() in ['covariance', 'cov']:
@@ -1199,7 +1119,7 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
         # 'length' of matrix is same as number of properties
         matrix_size = len(ylabels)
 
-        if ax is None:
+        if ax == None:
             fig = plt.figure(figsize=(5 * matrix_size, 5 * matrix_size))
 
             # Do not share y-axes, since covariance can have different amplitudes
@@ -1210,12 +1130,13 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
         # 'length' of matrix is one less than number of properties
         matrix_size = len(ylabels) - 1
 
-        if ax is None:
+        if ax == None:
             fig = plt.figure(figsize=(5 * matrix_size, 5 * matrix_size))
 
             # Share y-axes since by definition, correlation must be within -1 <= r <= 1
             ax = fig.subplots(matrix_size, matrix_size, sharex=True, sharey=True)
 
+    color = setup_color(color, split_bins, cmap=None)
 
     # Set all axes off by default. We will turn on only the lower-left-triangle
     if matrix_size > 1:
@@ -1225,7 +1146,12 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
 
     # if len(labels) < (len(ylabels) + 2):
     if labels is None:
+        ylabels.sort()
         labels = [xlabel] + ylabels + [split_label]
+    else:
+        # Sort ylabels alphebetically but make sure we also sort the label list (if provided) in sync
+        ylabels, temp = zip(*sorted(zip(ylabels, labels[1:-1])))
+        ylabels, labels[1:-1] = list(ylabels), list(temp)
 
     # Value to keep track of which column number we're in (leftmost is col = 0)
     # Set it to -1 here so in the first loop it goes to col = 0
@@ -1260,122 +1186,103 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
             else:
                 ax_tmp = ax
 
-            x_data, y_data, z_data, split_data = df[xlabel].to_numpy(), df[ylabel].to_numpy(), df[zlabel].to_numpy(), df[split_label].to_numpy()
-            Mask = clean_vector(x_data) & clean_vector(y_data) & clean_vector(z_data) & clean_vector(split_data)
-            x_data, y_data, z_data, split_data = x_data[Mask], y_data[Mask], z_data[Mask], split_data[Mask]
+            x_data, y_data, z_data, split_data = np.array(df[xlabel]), np.array(df[ylabel]), \
+                                                 np.array(df[zlabel]), np.array(df[split_label])
 
-            # Check if y_err is provided and load it
-            if y_errs is None:
-                y_err_data = None
-                z_err_data = None
-            else:
-                if isinstance(y_errs[i], str):
-                    y_err_data = df[y_errs[i]].to_numpy()[Mask]
-                else:
-                    y_err_data = None
+            if xrange is None:
+                xrange = [np.min(x_data) - 0.001, np.max(x_data) + 0.001]
 
-                if isinstance(y_errs[j], str):
-                    z_err_data = df[y_errs[j]].to_numpy()[Mask]
-                else:
-                    z_err_data = None
+            mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data)) & \
+                   np.invert(np.isinf(z_data)) & np.invert(np.isinf(split_data))
+
+            x_data, y_data, z_data, split_data = x_data[mask], y_data[mask], z_data[mask], split_data[mask]
 
             # Choose bin edges for binning data
             if (isinstance(split_bins, int)):
-                if split_mode.lower() == 'data':
+                if split_mode == 'Data':
                     split_bins = [np.percentile(split_data, float(i / split_bins) * 100) for i in
                                   range(0, split_bins + 1)]
-                elif split_mode.lower() == 'residuals':
-                    split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+                elif split_mode == 'Residuals':
+                    split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
                     split_bins = [np.percentile(split_res, float(i / split_bins) * 100) for i in
                                   range(0, split_bins + 1)]
-            elif isinstance(split_bins, (np.ndarray, list, tuple)) & (split_mode.lower() == 'residuals'):
-                split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+            elif isinstance(split_bins, (np.ndarray, list, tuple)) & (split_mode == 'Residuals'):
+                split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
 
-            # Define Output_Data variable to store all computed data that is then plotted
-            output_Data = {'Bin' + str(i): {} for i in range(len(split_bins) - 1)}
+            # Normally, we would define a dictionary for output here
+            # However, there is too much data here to print out all data shown in a matrix
+            # Instead one can obtain correlation plotting data using just the non-matrix version
 
             for k in range(len(split_bins) - 1):
 
-                if split_mode.lower() == 'data':
-                    split_Mask = (split_data <= split_bins[k + 1]) & (split_data > split_bins[k])
-                elif split_mode.lower() == 'residuals':
-                    split_Mask = (split_res <= split_bins[k + 1]) & (split_res > split_bins[k])
+                if split_mode == 'Data':
+                    split_mask = (split_data <= split_bins[k + 1]) & (split_data > split_bins[k])
+                elif split_mode == 'Residuals':
+                    split_mask = (split_res < split_bins[k + 1]) & (split_res > split_bins[k])
 
-                # Edge case for y_err
-                if y_err_data is None:
-                    y_err_data_in = None
-                else:
-                    y_err_data_in = y_err_data[split_Mask]
+                xline = np.linspace(xrange[0], xrange[1], nbins)
+                # xline = (xline[1:] + xline[:-1]) / 2.
 
-                if z_err_data is None:
-                    z_err_data_in = None
-                else:
-                    z_err_data_in = z_err_data[split_Mask]
+                cov_corr = np.zeros([nBootstrap, len(xline)])
 
-                if Output_mode.lower() in ['covariance', 'cov']:
-                    x, cov_corr = lm.covariance(x_data[split_Mask], y_data[split_Mask], z_data[split_Mask], y_err_data_in, z_err_data_in, xrange, bins, nBootstrap, fast_calc)
-                    cov_corr    = cov_corr * Params['scatter_factor']**2
+                for iBoot in range(nBootstrap):
 
-                elif Output_mode.lower() in ['correlation', 'corr']:
-                    x, cov_corr = lm.correlation(x_data[split_Mask], y_data[split_Mask], z_data[split_Mask], y_err_data_in, z_err_data_in, xrange, bins, nBootstrap, fast_calc)
+                    # First bootstrap realization is always just raw data
+                    if iBoot == 0:
+                        xx, yy, zz = x_data[split_mask], y_data[split_mask], z_data[split_mask]
 
-                if nBootstrap == 1: cov_corr = cov_corr[None, :]
+                    # All other bootstraps have shuffled data
+                    else:
+                        xx, index = lm.subsample(x_data[split_mask])
+                        yy = y_data[split_mask][index]
+                        zz = z_data[split_mask][index]
 
-                if split_mode.lower() == 'data':
+                    for l in range(len(xline)):
+
+                        if Output_mode.lower() in ['covariance', 'cov']:
+                            cov_corr[iBoot, l] = lm.calc_covariance_fixed_x(xx, yy, zz, xline[l])
+                        elif Output_mode.lower() in ['correlation', 'corr']:
+                            cov_corr[iBoot, l] = lm.calc_correlation_fixed_x(xx, yy, zz, xline[l])
+
+                if split_mode == 'Data':
                     label = r'$%0.2f <$ %s $< %0.2f$' % (split_bins[k], labels[-1], split_bins[k + 1])
-                elif split_mode.lower() == 'residuals':
+                elif split_mode == 'Residuals':
                     label = r'$%0.2f < {\rm res}($%s$) < %0.2f$' % (split_bins[k], labels[-1], split_bins[k + 1])
 
                 if xlog:
-                    x = 10 ** (x)
+                    xline = 10 ** (xline)
                     ax_tmp.set_xscale('log')
 
                 ax_tmp.axis('on')
-                ax_tmp.plot(x, np.percentile(cov_corr, 50, 0), lw=3, color=color[k], label=label)
-                ax_tmp.fill_between(x,
-                                    np.percentile(cov_corr, percentile[0], 0),
-                                    np.percentile(cov_corr, percentile[1], 0),
+                ax_tmp.plot(xline, np.mean(cov_corr, axis=0), lw=3, color=color[k], label=label)
+                ax_tmp.fill_between(xline,
+                                    np.percentile(cov_corr, percentile[0], axis=0),
+                                    np.percentile(cov_corr, percentile[1], axis=0),
                                     alpha=0.4, label=None, color=color[k])
 
-                output_Data['Bin' + str(k)]['x'] = x
-
-                if Output_mode.lower() in ['covariance', 'cov']:
-                    name = 'cov'
-                elif Output_mode.lower() in ['correlation', 'corr']:
-                    name = 'corr'
-
-                output_Data['Bin' + str(k)]['%s_%s_%s'%(name, ylabel, zlabel)]  = np.percentile(cov_corr, 50, 0)
-                output_Data['Bin' + str(k)]['%s_%s_%s-'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[0], 0)
-                output_Data['Bin' + str(k)]['%s_%s_%s+'%(name, ylabel, zlabel)] = np.percentile(cov_corr, percentile[1], 0)
-
-            ax_tmp.grid(True)
+            ax_tmp.grid()
 
             if Output_mode.lower() in ['correlation', 'corr']:
                 ax_tmp.axhline(y=0.0, color='k', lw=2)
-                ax_tmp.set_ylim(ymin=-1.05, ymax=1.05)
+                ax_tmp.set_ylim(ymin=-1, ymax=1)
 
             if col == row:
-
-                #Remove any text that exists already
-                for text in ax_tmp.texts:
-                    text.set_visible(False)
-
-                ax_tmp.text(1.02, 0.5, labels[1 + j], size=Params['ylabel_fontsize'],
+                ax_tmp.text(1.02, 0.5, labels[1 + j], size=fontsize.ylabel,
                             horizontalalignment='left', verticalalignment='center', rotation=270, clip_on=False,
                             transform=ax_tmp.transAxes)
             if row == col:
-                ax_tmp.set_title(labels[1 + i], size=Params['xlabel_fontsize'], pad = 15)
+                ax_tmp.set_title(labels[1 + i], size=fontsize.xlabel)
 
             if row == matrix_size - 1:
-                ax_tmp.set_xlabel(labels[0], size=Params['xlabel_fontsize'])
+                ax_tmp.set_xlabel(labels[0], size=fontsize.xlabel)
 
             if col == 0:
                 if Output_mode.lower() in ['correlation', 'corr']:
-                    ax_tmp.set_ylabel('r', size=Params['xlabel_fontsize'])
+                    ax_tmp.set_ylabel('r', size=fontsize.xlabel)
                 else:
-                    ax_tmp.set_ylabel('cov', size=Params['xlabel_fontsize'])
+                    ax_tmp.set_ylabel('cov', size=fontsize.xlabel)
 
-            ax_tmp.tick_params(axis='both', which='major')
+            ax_tmp.tick_params(axis='both', which='major', labelsize=12)
 
             row += 1
 
@@ -1391,258 +1298,106 @@ def Plot_Cov_Corr_Matrix_Split(df, xlabel, ylabels, split_label, split_bins=[], 
         if Output_mode.lower() in ['correlation', 'corr']: plt.subplots_adjust(hspace=0.04, wspace=0.04)
         else: plt.subplots_adjust(hspace=0.04)
     else:
-        plt.legend(fontsize=Params['legend_fontsize'])
+        plt.legend(fontsize=fontsize.legend)
 
-    return output_Data, ax
+    return ax
 
-
-def Plot_Residual(df, xlabel, ylabel, y_err = None, bins=25, xrange=None, PDFbins = 15, PDFrange=(-4, 4), nBootstrap=100,
-                  return_moments = False, kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.], fast_calc = False,
-                  labels=None, color=None, ax=None):
-    '''
-    This function visualizes the histogram of residuals about the best fit curve.
-
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    y_err : numpy array, optional
-        Uncertainty on dependent variable, y.
-        Must contain only non-zero positive values.
-        Default is None.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+def Plot_Residual(df, xlabel, ylabel, nbins=15, xrange=None, PDFrange=(-4, 4), nBootstrap=1000,
+                  kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.],
+                  funcs={}, labels=None, color=None, verbose=True, ax=None):
 
     lm = kllr_model(kernel_type, kernel_width)
 
-    if ax is None:
+    if ax == None:
         ax = plt.figure(figsize=(12, 8))
 
-    plt.grid(True)
+    plt.grid()
 
     if labels is None:
-        labels = [r'$(y - \langle y \rangle)/\sigma_{y},\,\,[y = $ %s $]$' % ylabel, 'PDF']
+        labels = [r'normalized residuals of %s' % ylabel, 'PDF']
     else:
-        labels = [r'$(y - \langle y \rangle)/\sigma_{y},\,\,[y = $ %s $]$' % labels[0], labels[1]]
+        labels = [r'normalized residuals of %s' % labels[0], 'PDF', labels[1]]
 
     # Dictionary that will store values to be output
     output_Data = {}
+    results = funcs.keys()
 
-    x_data, y_data = df[xlabel].to_numpy(), df[ylabel].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data)
-    x_data, y_data = x_data[Mask], y_data[Mask]
+    x_data, y_data = np.array(df[xlabel]), np.array(df[ylabel])
 
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data) | np.isnan(y_data))
 
-    else:
-        y_err_data = None
+    x_data, y_data = x_data[mask], y_data[mask]
 
-    dy = lm.residuals(x_data, y_data, y_err, xrange, bins, nBootstrap, fast_calc)
+    dy = lm.calculate_residual(x_data, y_data, xrange=xrange, nbins = nbins)
 
-    if nBootstrap == 1: dy = dy[None, :]
+    output_Data['Residuals'] = dy
 
-    PDFbins = setup_bins(PDFrange, PDFbins, None)
-    PDFs = np.empty([nBootstrap, len(PDFbins) - 1])
+    PDFs, bins, output = lm.PDF_generator(dy, nbins, nBootstrap, funcs, xrange=PDFrange, density=True, verbose=verbose)
 
-    for i in range(nBootstrap):
-        PDFs[i, :] = np.histogram(dy[i, :], bins = PDFbins, range = PDFrange, density = True)[0]
+    for r in results:
+        min = np.percentile(output[r], percentile[0])
+        mean = np.mean(output[r])
+        max = np.percentile(output[r], percentile[1])
+        print(r, ":", np.round(min - mean, 4), np.round(mean, 4), np.round(max - mean, 4))
 
-    if return_moments:
+        output_Data[r + '-'] = np.percentile(output[r], percentile[0])
+        output_Data[r] = np.median(output[r])
+        output_Data[r + '+'] = np.percentile(output[r], percentile[1])
 
-        mean = np.mean(dy, axis = 1)
-        sdev = np.std(dy, axis = 1)
-        skew = stats.skew(dy, axis = 1)
-        kurt = stats.kurtosis(dy, axis = 1, fisher = False)
-
-    PDFbins_plot = (PDFbins[1:] + PDFbins[:-1]) / 2.
-
-    p = plt.plot(PDFbins_plot, np.percentile(PDFs, 50, 0), lw=3, color=color)
+    p = plt.plot(bins, np.mean(PDFs, axis=0), lw=3, color=color)
     color = p[0].get_color()
-    plt.fill_between(PDFbins_plot, np.percentile(PDFs, percentile[0], 0), np.percentile(PDFs, percentile[1], 0),
+    plt.fill_between(bins, np.percentile(PDFs, percentile[0], axis=0), np.percentile(PDFs, percentile[1], axis=0),
                      alpha=0.4, label=None, color=color)
 
-    output_Data['Residuals']  = np.percentile(dy, 50, 0)
-    output_Data['Residuals-'] = np.percentile(dy, percentile[0], 0)
-    output_Data['Residuals+'] = np.percentile(dy, percentile[1], 0)
-    output_Data['PDFs']       = PDFs
-    output_Data['PDFbins']    = PDFbins_plot
-
-    if return_moments:
-        output_Data['mean']  = np.percentile(mean, 50)
-        output_Data['mean-'] = np.percentile(mean, percentile[0])
-        output_Data['mean+'] = np.percentile(mean, percentile[1])
-
-        output_Data['sdev']  = np.percentile(sdev, 50)
-        output_Data['sdev-'] = np.percentile(sdev, percentile[0])
-        output_Data['sdev+'] = np.percentile(sdev, percentile[1])
-
-        output_Data['skew']  = np.percentile(skew, 50)
-        output_Data['skew-'] = np.percentile(skew, percentile[0])
-        output_Data['skew+'] = np.percentile(skew, percentile[1])
-
-        output_Data['kurt']  = np.percentile(kurt, 50)
-        output_Data['kurt-'] = np.percentile(kurt, percentile[0])
-        output_Data['kurt+'] = np.percentile(kurt, percentile[1])
-
-    plt.xlabel(labels[0], size=Params['xlabel_fontsize'])
-    plt.ylabel(labels[1], size=Params['ylabel_fontsize'])
+    plt.xlabel(labels[0], size=fontsize.xlabel)
+    plt.ylabel(labels[1], size=fontsize.ylabel)
+    plt.legend(fontsize=fontsize.legend)
 
     return output_Data, ax
 
-
-def Plot_Residual_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mode='Data', y_err = None, bins=25, xrange=None,
-                        PDFbins = 15, PDFrange=(-4, 4), nBootstrap=100, return_moments = False,
-                        kernel_type='gaussian', kernel_width=0.2, fast_calc = False,
-                        percentile=[16., 84.], labels=None, color=None, cmap = None, ax=None):
-    '''
-    This function stratifies data on split variable and then visualizes
-     the histogram of residuals about the best fit curve.
-
-    Parameters
-    -------------
-    df : pandas dataframe
-        DataFrame containing all properties
-
-    xlabel, ylabel(s) : str
-        labels of the data vectors of interest in the dataframe.
-        In case of covariance/correlation matrix functions, we pass a list of labels into the "ylabels" parameter.
-
-    bins : int
-        Sets the number of points within x_range that the parameters are sampled at.
-        When plotting a PDF it sets the number of bins the PDF is split into.
-
-    xrange : list, tuple, np.array
-        A 2-element list, tuple, or numpy array that sets the range of x-values for which we compute and plot parameters.
-        By default, xrange = None, and the codes will choose np.min(x_data) and np.max(x_data) as lower and upper bounds.
-
-    nBootstrap : int
-        Sets how many bootstrap realizations are made when determining statistical error in parameters.
-
-    percentile : list, tuple, np.array
-        List, tuple, or numpy array whose values set the bounds of parameter distribution to be plotted when plotting uncertainties.
-        Assuming gaussianity for the distributions, a 1sigma bound can be gained using [16., 84.], which is also the default value.
-
-    split_label : str
-        Label of the data vector used to split the data, or condition the data, on a secondary variable.
-
-    split_bins : int, list, tuple, numpy array
-        Can be either number of bins (int), or array of bin_edges.
-
-        If an int is provided the modules will determine the bin edges themselves using the data vector.
-        By default, edges are set so there are equal number of data points in each bin.
-        Note that the bin edges in this case will be determined using all data passed into the function. However,
-        the plotting and computations will be done only using data with x-values within the bounds set by the xrange parameter.
-
-        If a list is provided then the list elements serve as the bin edges
-
-    split_mode : str
-
-        Sets how the data is split/conditioned based on the split variable
-        If 'Data', then all halos are binned based on the variable df[split_label]
-        If 'Residuals', then we fit split_label vs. xlabel, then split the data into bins based on the residual values
-
-    labels : list of str
-        Allows for user-defined labels for x-axis, y-axis, legend labels.
-
-    kernel_type : string, optional
-        The kernel type, ['gaussian', 'tophat'] else it assumes tophat kernel. The default is Gaussian
-
-    kernel_width : float, optional
-        If kernel_type = 'gaussian' then 'width' is the width of the gaussian kernels.
-        If kernel_type = 'tophat' then 'width' is the width of the tophat kernels.
-
-    fast_calc : boolean
-        When False, do nothing
-        When True , the method only uses data within 3 x kernel_width from the scale mu.
-          It speeds up the calculation by removing objects that have exteremly small weight.
-
-
-    Returns
-    -------
-        output_Data: summary of estimated parameters
-        ax: matplot object
-    '''
+def Plot_Residual_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mode='Data', nbins=15, xrange=None,
+                        PDFrange=(-4, 4), nBootstrap=1000, kernel_type='gaussian', kernel_width=0.2,
+                        percentile=[16., 84.], labels=None, funcs={}, color=None, verbose=True, ax=None):
 
     check_attributes(split_bins=split_bins, split_mode=split_mode)
 
-    lm   = kllr_model(kernel_type, kernel_width)
+    lm = kllr_model(kernel_type, kernel_width)
 
-    if ax is None:
+    if ax == None:
         ax = plt.figure(figsize=(12, 8))
 
-    color = setup_color(color, split_bins, cmap)
+    color = setup_color(color, split_bins, cmap=None)
 
-    plt.grid(True)
+    plt.grid()
 
     if labels is None:
-        labels = [r'$(y - \langle y \rangle)/\sigma_{y},\,\,[y = $ %s $]$' % ylabel, 'PDF', split_label]
+        labels = [r'normalized residuals of %s' % ylabel, 'PDF', split_label]
     else:
-        labels = [r'$(y - \langle y \rangle)/\sigma_{y},\,\,[y = $ %s $]$' % labels[0], labels[1], labels[2]]
+        labels = [r'normalized residuals of %s' % labels[0], 'PDF', labels[1]]
 
     # Dictionary that will store values to be output
-    output_Data = {}
+    results = funcs.keys()
 
-    x_data, y_data, split_data = df[xlabel].to_numpy(), df[ylabel].to_numpy(), df[split_label].to_numpy()
-    Mask = clean_vector(x_data) & clean_vector(y_data) & clean_vector(split_data)
-    x_data, y_data, split_data = x_data[Mask], y_data[Mask], split_data[Mask]
+    # Load data and mask it
+    x_data, y_data, split_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[split_label])
 
-    # Check if y_err is provided and load it
-    if isinstance(y_err, str):
-        y_err_data = df[y_err].to_numpy()[Mask]
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data) | np.isnan(y_data)) & np.invert(
+        np.isinf(split_data) | np.isnan(split_data))
 
-    else:
-        y_err_data = None
+    x_data, y_data, split_data = x_data[mask], y_data[mask], split_data[mask]
+
+    if xrange is None:
+        xrange = [np.min(x_data) - 0.001, np.max(x_data) + 0.001]
 
     # Choose bin edges for binning data
     if isinstance(split_bins, int):
         if split_mode == 'Data':
             split_bins = [np.percentile(split_data, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
-
         elif split_mode == 'Residuals':
-            split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+            split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
             split_bins = [np.percentile(split_res, float(i / split_bins) * 100) for i in range(0, split_bins + 1)]
-
     elif isinstance(split_bins, (np.ndarray, list, tuple)) & (split_mode == 'Residuals'):
-        split_res = lm.residuals(x_data, split_data, xrange=None, bins = bins, nBootstrap = 1)
+        split_res = lm.calculate_residual(x_data, split_data, xrange=xrange)
 
     # Define Output_Data variable to store all computed data that is then plotted
     output_Data = {'Bin' + str(i): {} for i in range(len(split_bins) - 1)}
@@ -1652,98 +1407,134 @@ def Plot_Residual_Split(df, xlabel, ylabel, split_label, split_bins=[], split_mo
     # And that way differences in the PDF are inherent
     # Modulating LLR params for each split_bin would wash away the differences in
     # the PDFs of each split_bin
-    dy = lm.residuals(x_data, y_data, y_err, None, bins, nBootstrap, fast_calc)
+    dy = lm.calculate_residual(x_data, y_data, xrange=xrange)
 
-    if nBootstrap == 1: dy = dy[None, :]
-
-    # Setup xrange if it is empty
-    if xrange is None:
-        xrange = [np.min(x_data), np.max(x_data)]
-
-    elif xrange[0] is None:
-        xrange[0] = np.min(x_data)
-
-    elif xrange[1] is None:
-        xrange[1] = np.max(x_data)
-
-    # Generate Mask so only objects within xrange are used in PDF
-    # Need this to make sure dy and split_data are the same length
-    xrange_Mask = (x_data <= xrange[1]) & (x_data >= xrange[0])
+    #Generate mask so only objects within xrange are used in PDF
+    #Need this to make sure dy and split_data are the same length
+    xrange_mask = (x_data < xrange[1]) & (x_data > xrange[0])
 
     # Separately plot the PDF of data in each bin
     for i in range(len(split_bins) - 1):
 
         if split_mode == 'Data':
-            split_Mask = (split_data[xrange_Mask] < split_bins[i + 1]) & (split_data[xrange_Mask] > split_bins[i])
+            split_mask = (split_data[xrange_mask] < split_bins[i + 1]) & (split_data[xrange_mask] > split_bins[i])
 
         elif split_mode == 'Residuals':
-            split_Mask = (split_res[xrange_Mask] < split_bins[i + 1]) & (split_res[xrange_Mask] > split_bins[i])
+            split_mask = (split_res[xrange_mask] < split_bins[i + 1]) & (split_res[xrange_mask] > split_bins[i])
 
-        PDFbins = setup_bins(PDFrange, PDFbins, None)
-        PDFs = np.empty([nBootstrap, len(PDFbins) - 1])
+        output_Data['Bin' + str(i)]['Residuals'] = dy[split_mask]
 
-        for j in range(nBootstrap):
-            PDFs[j, :] = np.histogram(dy[j, split_Mask], bins = PDFbins, range = PDFrange, density = True)[0]
+        PDFs, bins, output = lm.PDF_generator(dy[split_mask], nbins, nBootstrap, funcs,
+                                              xrange=PDFrange, density=True, verbose=verbose)
 
-        if return_moments:
+        for r in results:
+            min = np.percentile(output[r], percentile[0])
+            mean = np.mean(output[r])
+            max = np.percentile(output[r], percentile[1])
+            print(r, ":", np.round(min - mean, 4), np.round(mean, 4), np.round(max - mean, 4))
 
-            mean = np.mean(dy, axis = 1)
-            sdev = np.std(dy, axis = 1)
-            skew = stats.skew(dy, axis = 1)
-            kurt = stats.kurtosis(dy, axis = 1, fisher = False)
-
-        PDFbins_plot = (PDFbins[1:] + PDFbins[:-1]) / 2.
+            output_Data['Bin' + str(i)][r + '-'] = np.percentile(output[r], percentile[0])
+            output_Data['Bin' + str(i)][r] = np.median(output[r])
+            output_Data['Bin' + str(i)][r + '+'] = np.percentile(output[r], percentile[1])
 
         if split_mode == 'Data':
             label = r'$%0.2f <$ %s $< %0.2f$' % (split_bins[i], labels[2], split_bins[i + 1])
         elif split_mode == 'Residuals':
             label = r'$%0.2f < {\rm res}($%s$) < %0.2f$' % (split_bins[i], labels[2], split_bins[i + 1])
 
-        plt.plot(PDFbins_plot, np.percentile(PDFs, 50, 0), lw=3, color=color[i], label = label)
-        plt.fill_between(PDFbins_plot, np.percentile(PDFs, percentile[0], 0), np.percentile(PDFs, percentile[1], 0),
+        plt.plot(bins, np.mean(PDFs, axis=0), lw=3, color=color[i], label=label)
+        plt.fill_between(bins, np.percentile(PDFs, percentile[0], axis=0), np.percentile(PDFs, percentile[1], axis=0),
                          alpha=0.4, label=None, color=color[i])
 
-        output_Data['Bin' + str(i)]['Residuals']  = np.percentile(dy, 50, 0)[split_Mask]
-        output_Data['Bin' + str(i)]['Residuals-'] = np.percentile(dy, percentile[0], 0)[split_Mask]
-        output_Data['Bin' + str(i)]['Residuals+'] = np.percentile(dy, percentile[1], 0)[split_Mask]
-        output_Data['Bin' + str(i)]['PDFs']       = PDFs
-        output_Data['Bin' + str(i)]['PDFbins']    = PDFbins_plot
-
-        if return_moments:
-            output_Data['Bin' + str(i)]['mean']  = np.percentile(mean, 50)
-            output_Data['Bin' + str(i)]['mean-'] = np.percentile(mean, percentile[0])
-            output_Data['Bin' + str(i)]['mean+'] = np.percentile(mean, percentile[1])
-
-            output_Data['Bin' + str(i)]['sdev']  = np.percentile(sdev, 50)
-            output_Data['Bin' + str(i)]['sdev-'] = np.percentile(sdev, percentile[0])
-            output_Data['Bin' + str(i)]['sdev+'] = np.percentile(sdev, percentile[1])
-
-            output_Data['Bin' + str(i)]['skew']  = np.percentile(skew, 50)
-            output_Data['Bin' + str(i)]['skew-'] = np.percentile(skew, percentile[0])
-            output_Data['Bin' + str(i)]['skew+'] = np.percentile(skew, percentile[1])
-
-            output_Data['Bin' + str(i)]['kurt']  = np.percentile(kurt, 50)
-            output_Data['Bin' + str(i)]['kurt-'] = np.percentile(kurt, percentile[0])
-            output_Data['Bin' + str(i)]['kurt+'] = np.percentile(kurt, percentile[1])
-
-    plt.xlabel(labels[0], size=Params['xlabel_fontsize'])
-    plt.ylabel(labels[1], size=Params['ylabel_fontsize'])
-    plt.legend(fontsize=Params['legend_fontsize'])
+    plt.xlabel(labels[0], size=fontsize.xlabel)
+    plt.ylabel(labels[1], size=fontsize.ylabel)
+    plt.legend(fontsize=fontsize.legend)
 
     return output_Data, ax
 
+def Plot_Shapley_Values(df, xlabel, ylabel, zlabels, nbins=25, xrange=None, nBootstrap=100, n_jobs = 1,
+                        kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.], approximate = True,
+                        xlog=False, labels=None, color=None, verbose=True, ax=None, max_samples = None,
+                        n_estimators = 100, normalized = False, iter_smooth = 3, show_error = False,
+                        no_plot = False):
+
+    lm = kllr_model()
+
+    if ax == None:
+        ax = plt.figure(figsize=(12, 8))
+
+    if xlog:
+        plt.xscale('log')
+
+    plt.grid()
+
+    if labels is None:
+        labels = [xlabel, r'$\mu(|\phi_{\rm SHAP}/\Delta{' + ylabel + '}|)$'] + zlabels
+    else:
+        labels = [labels[0], r'$\mu(|\phi_{\rm SHAP}/\Delta{' + labels[1] + '}|)$'] + labels[2:]
+
+    Mask = (df != np.inf) & (df != -np.inf) & np.invert(df.isnull())
+
+    df = df[Mask]
+
+    x_data, y_data, z_data = np.array(df[xlabel]), np.array(df[ylabel]), df[zlabels].to_numpy()
+
+    dy = lm.calculate_residual(x_data, y_data)
+
+    dz_data = np.zeros_like(z_data)
+
+    # for z_ind in range(dz_data.shape[1]):
+    #
+    #     print(z_ind)
+    #
+    #     dz_data[:, z_ind] = lm.calculate_residual(x_data, z_data[:, z_ind])
+
+    xline, phi_SHAP = lm.Shapley_values(x_data, dy, z_data, xrange, nbins,
+                                        kernel_type = kernel_type, kernel_width = kernel_width, n_jobs = n_jobs,
+                                        max_samples = max_samples, n_estimators = n_estimators)
+
+    phi_SHAP /= dy[:, np.newaxis]
+    phi_SHAP  = np.abs(phi_SHAP)
+
+    Median_contribution = np.nanpercentile(phi_SHAP, 50., axis = 1)
+    Upper_contribution  = np.nanpercentile(phi_SHAP, percentile[1], axis = 1)
+    Lower_contribution  = np.nanpercentile(phi_SHAP, percentile[0], axis = 1)
+
+    for j in range(iter_smooth):
+        Median_contribution[1:-1, :] = (Median_contribution[:-2,  :] +
+                                        2*Median_contribution[1:-1, :] +
+                                        Median_contribution[2:,   :])/4
+
+    if xlog:
+        x_temp = 10**xline
+    else:
+        x_temp = xline
+
+    # plt.plot(x_temp, np.nanmedian(np.sum(normed_phi_SHAP, axis = 2), axis = 1), lw = 3)
+
+    # print(labels, Median_contribution.shape)
+    for i in range(len(zlabels)):
+        p = plt.plot(x_temp, Median_contribution[:, i], label = labels[i + 2], lw = 3)
+        color = p[0].get_color()
+        if show_error:
+            plt.fill_between(x_temp, Upper_contribution[:, i], Lower_contribution[:, i], alpha = 0.15, color = color)
+
+    plt.xlabel(labels[0], size = fontsize.xlabel)
+    plt.ylabel(labels[1], size = fontsize.ylabel)
+    plt.legend(fontsize = fontsize.legend)
+
+    if no_plot: plt.close()
+
+    return phi_SHAP, ax
 
 def check_attributes(split_bins=10, Output_mode='corr', split_mode='Data'):
-    """
-    check if the attributes are in correct format.
-    """
 
     if not isinstance(split_bins, int) and not isinstance(split_bins, (np.ndarray, list, tuple)):
         raise TypeError("split_bins must be an integer number or a list of float numbers, "
                         "split_bins is type '%s' "%type(split_bins))
     elif isinstance(split_bins, int) and split_bins < 2:
         raise ValueError('split_bins must be an integer number larger than 1, split_bins is %i'%split_bins)
-    elif isinstance(split_bins, (np.ndarray, list, tuple)) and len(split_bins) <= 1:
+    elif isinstance(split_bins, int) and split_bins < 2:
         raise ValueError('len(split_bins) must be larger than 1, len(split_bins) is %i'%len(split_bins))
 
     if Output_mode.lower() not in ['correlation', 'corr', 'covariance', 'cov']:
@@ -1755,18 +1546,162 @@ def check_attributes(split_bins=10, Output_mode='corr', split_mode='Data'):
                          "split_mode is `%s`."%split_mode)
 
 
-def clean_vector(var):
-    '''
-    Convenience function that simply checks
-    the data vector for any values of inf, -inf, or NaN.
-    Returns a Mask that is True only for
-    "good" values.
-    '''
 
-    #Check which entries are problematic
-    Mask = np.isinf(var) | np.isneginf(var) | np.isnan(var)
+#Remove functions later
 
-    if len(var.shape) > 1:
-        return np.all(np.invert(Mask), axis = 1)
-    elif len(var.shape) == 1:
-        return np.invert(Mask)
+def Plot_Fit_Summary_for_Paper(df, xlabel, ylabel, nbins=25, xrange=None, nBootstrap=100, show_data=False,
+                               kernel_type='gaussian', kernel_width=0.2, percentile=[16., 84.], ls = '-',
+                               xlog=False, ylog = False, labels=None, color=None, verbose=True):
+
+    lm = kllr_model(kernel_type, kernel_width)
+
+    # Dictionary to store output values
+    output_Data = {}
+
+    # Load and mask data
+    x_data, y_data = np.array(df[xlabel]), np.array(df[ylabel])
+
+    mask = np.invert(np.isinf(x_data)) & np.invert(np.isinf(y_data))
+
+    x_data, y_data = x_data[mask], y_data[mask]
+
+    xline, yline, _, slope, scatter, skew = lm.fit_bootstrapped(x_data, y_data, xrange=xrange, nbins=nbins, nBootstrap = nBootstrap)
+
+    if xlog: xline = 10 ** xline
+    if ylog: yline = 10 ** yline
+
+    output_Data['x']  = xline
+
+    if ylog:
+        output_Data['y']    = 10**np.median(np.log10(yline), axis = 0)
+        output_Data['y-']   = 10**np.percentile(np.log10(yline), 50 - 68/2, axis=0)
+        output_Data['y+']   = 10**np.percentile(np.log10(yline), 50 + 68/2, axis=0)
+        output_Data['y--']  = 10**np.percentile(np.log10(yline), 50 - 95/2, axis=0)
+        output_Data['y++']  = 10**np.percentile(np.log10(yline), 50 + 95/2, axis=0)
+        output_Data['y---'] = 10**np.percentile(np.log10(yline), 50 - 99.7/2, axis=0)
+        output_Data['y+++'] = 10**np.percentile(np.log10(yline), 50 + 99.7/2, axis=0)
+    else:
+        output_Data['y']    = np.median(yline, axis = 0)
+        output_Data['y-']   = np.percentile(yline, 50 - 68/2, axis=0)
+        output_Data['y+']   = np.percentile(yline, 50 + 68/2, axis=0)
+        output_Data['y--']  = np.percentile(yline, 50 - 95/2, axis=0)
+        output_Data['y++']  = np.percentile(yline, 50 + 95/2, axis=0)
+        output_Data['y---'] = np.percentile(yline, 50 - 99.7/2, axis=0)
+        output_Data['y+++'] = np.percentile(yline, 50 + 99.7/2, axis=0)
+
+    output_Data['slope']    = np.median(slope, axis=0)
+    output_Data['slope-']   = np.percentile(slope, 50 - 68/2, axis=0)
+    output_Data['slope+']   = np.percentile(slope, 50 + 68/2, axis=0)
+    output_Data['slope--']  = np.percentile(slope, 50 - 95/2, axis=0)
+    output_Data['slope++']  = np.percentile(slope, 50 + 95/2, axis=0)
+    output_Data['slope---'] = np.percentile(slope, 50 - 99.7/2, axis=0)
+    output_Data['slope+++'] = np.percentile(slope, 50 + 99.7/2, axis=0)
+
+    # Output data for scatter (in ln terms)
+    output_Data['scatter']    = np.median(scatter, axis=0) * Ln10
+    output_Data['scatter-']   = np.percentile(scatter, 50 - 68/2, axis=0) * Ln10
+    output_Data['scatter+']   = np.percentile(scatter, 50 + 68/2, axis=0) * Ln10
+    output_Data['scatter--']  = np.percentile(scatter, 50 - 95/2, axis=0) * Ln10
+    output_Data['scatter++']  = np.percentile(scatter, 50 + 95/2, axis=0) * Ln10
+    output_Data['scatter---'] = np.percentile(scatter, 50 - 99.7/2, axis=0) * Ln10
+    output_Data['scatter+++'] = np.percentile(scatter, 50 + 99.7/2, axis=0) * Ln10
+
+    # Output for skew
+    output_Data['skew']    = np.median(skew, axis=0)
+    output_Data['skew-']   = np.percentile(skew, 50 - 68/2, axis=0)
+    output_Data['skew+']   = np.percentile(skew, 50 + 68/2, axis=0)
+    output_Data['skew--']  = np.percentile(skew, 50 - 95/2, axis=0)
+    output_Data['skew++']  = np.percentile(skew, 50 + 95/2, axis=0)
+    output_Data['skew---'] = np.percentile(skew, 50 - 99.7/2, axis=0)
+    output_Data['skew+++'] = np.percentile(skew, 50 + 99.7/2, axis=0)
+
+    return output_Data
+
+def Plot_Cov_Corr_For_Paper(df, xlabel, ylabel, zlabel, nbins=25, xrange=None, nBootstrap=100,
+                            Output_mode='Covariance', kernel_type='gaussian', kernel_width=0.2,
+                            percentile=[16., 84.], xlog=False, labels=None, color=None,
+                            verbose=True, ax=None):
+
+    check_attributes(Output_mode=Output_mode)
+
+    lm = kllr_model(kernel_type, kernel_width)
+
+    #Dictionary to store values
+    output_Data = {}
+
+    if xrange == None:
+        x_data = np.array(df[xlabel])
+        xrange = (np.min(x) - 0.01, np.max(x) + 0.01)
+    elif xrange[0] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[0] = np.min(x) - 0.01
+    elif xrange[1] == None:
+        x_data    = np.array(df[xlabel])
+        xrange[1] = np.max(x) + 0.01
+
+    xline = np.linspace(xrange[0], xrange[1], nbins, endpoint=True)
+
+    if verbose:
+        iterations_list = tqdm(range(len(xline)))
+    else:
+        iterations_list = range(len(xline))
+
+    if kernel_width is None:
+        kernel_width = self.kernel_width
+
+    #If kernel_width is just one number, then turn it
+    #into an array of length = nbins
+    if isinstance(kernel_width, (int, float)):
+        kernel_width_array = np.ones(nbins)*kernel_width
+
+    elif len(kernel_width) != len(xline):
+        #Check if kernel_width has right dimensions
+        raise ValueError("Size mismatch: kernel_width has length %d. Paramater nbins = %d"%(len(kernel_width), nbins))
+    #Otherwise rename value for rest of code
+    else:
+        kernel_width_array = kernel_width
+
+    x_data, y_data, z_data = np.array(df[xlabel]), np.array(df[ylabel]), np.array(df[zlabel])
+    mask = np.invert(np.isinf(x_data)) & (np.invert(np.isinf(y_data))) & (np.invert(np.isinf(z_data)))
+    x_data, y_data, z_data = x_data[mask], y_data[mask], z_data[mask]
+
+    cov_corr = np.zeros([nBootstrap, len(xline)])
+
+    for k in iterations_list:
+
+        #Add mask to reduce data and improve
+        #efficiency (hopefully)
+        x_Mask = (x_data > xline[k] - 3*kernel_width_array[k]) & (x_data < xline[k] + 3*kernel_width_array[k])
+
+        x_masked, y_masked, z_masked = x_data[x_Mask], y_data[x_Mask], z_data[x_Mask]
+
+        if Output_mode.lower() in ['covariance', 'cov']:
+            cov_corr[:, k] = lm.calc_covariance_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                        kernel_width=kernel_width_array[k],
+                                                        parametric_bootstrap = True,
+                                                        nBootstrap = nBootstrap)
+        elif Output_mode.lower() in ['correlation', 'corr']:
+            cov_corr[:, k] = lm.calc_correlation_fixed_x(x_masked, y_masked, z_masked, xline[k],
+                                                         kernel_width=kernel_width_array[k],
+                                                         parametric_bootstrap = True,
+                                                         nBootstrap = nBootstrap)
+
+    if xlog: xline = 10**xline
+
+    if Output_mode.lower() in ['covariance', 'cov']:
+        name = 'cov'
+    elif Output_mode.lower() in ['correlation', 'corr']:
+        name = 'corr'
+
+
+    output_Data['x'] = xline
+
+    output_Data['%s_%s_%s'%(name, ylabel, zlabel)]    = np.median(cov_corr, axis=0)
+    output_Data['%s_%s_%s-'%(name, ylabel, zlabel)]   = np.percentile(cov_corr, 50 - 68/2, axis=0)
+    output_Data['%s_%s_%s+'%(name, ylabel, zlabel)]   = np.percentile(cov_corr, 50 + 68/2, axis=0)
+    output_Data['%s_%s_%s--'%(name, ylabel, zlabel)]  = np.percentile(cov_corr, 50 - 95/2, axis=0)
+    output_Data['%s_%s_%s++'%(name, ylabel, zlabel)]  = np.percentile(cov_corr, 50 + 95/2, axis=0)
+    output_Data['%s_%s_%s---'%(name, ylabel, zlabel)] = np.percentile(cov_corr, 50 - 99.7/2, axis=0)
+    output_Data['%s_%s_%s+++'%(name, ylabel, zlabel)] = np.percentile(cov_corr, 50 + 99.7/2, axis=0)
+
+    return output_Data
