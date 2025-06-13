@@ -1166,7 +1166,8 @@ class kllr_model():
             self.kernel_type = kernel_type
 
         #Output array
-        phi_SHAP = np.ones(shape = (nbins, Z.shape[0], Z.shape[1]))*np.nan
+        Nmax     = 2000
+        phi_SHAP = np.ones(shape = (nbins, Nmax, Z.shape[1]))*np.nan
 
 
         #Loop over sample points
@@ -1186,10 +1187,12 @@ class kllr_model():
             if N_limit < Mask.sum():
                 subsample_index = np.random.randint(0, Mask.sum(), N_limit)
                 index = np.where(Mask)[0][subsample_index]
+                max   = Nmax
             else:
                 index = np.where(Mask)[0]
+                max   = np.sum(Mask)
 
-            phi_SHAP[i, index, :] = (shap.TreeExplainer(model, data = None)
+            phi_SHAP[i, :max, :] = (shap.TreeExplainer(model, data = None)
                                          .shap_values(Z[index, :], check_additivity = True))
 
             # import matplotlib.pyplot as plt
